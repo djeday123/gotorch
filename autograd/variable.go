@@ -1,8 +1,6 @@
 package autograd
 
-import (
-	"gotorch_v1/tensor"
-)
+import "gotorch_v1/tensor"
 
 // GradFn is implemented by every differentiable operation.
 // Apply receives the upstream gradient and returns gradients
@@ -28,6 +26,12 @@ func NewVar(t *tensor.Tensor, requiresGrad bool) *Variable {
 		RequiresGrad: requiresGrad,
 		isLeaf:       true,
 	}
+}
+
+// NewResult creates an intermediate (non-leaf) Variable produced by an op.
+// Exported so that the nn package can build custom differentiable layers.
+func NewResult(t *tensor.Tensor, gradFn GradFn, children ...*Variable) *Variable {
+	return newResult(t, gradFn, children...)
 }
 
 // newResult creates an intermediate (non-leaf) Variable produced by an op.
@@ -63,11 +67,9 @@ func (v *Variable) BackwardWithGrad(grad *tensor.Tensor) {
 	backward(v, grad)
 }
 
-// ZeroGrad sets this variable's gradient to zero.
+// ZeroGrad sets this variable's gradient to nil (clears accumulated gradient).
 func (v *Variable) ZeroGrad() {
-	if v.Grad != nil {
-		v.Grad = tensor.Zeros(v.Data.Shape()...)
-	}
+	v.Grad = nil
 }
 
 // Detach returns a new leaf Variable sharing the same data but without grad tracking.
