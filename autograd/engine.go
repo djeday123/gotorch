@@ -1,6 +1,6 @@
 package autograd
 
-import "gotorch_v1/tensor"
+import "github.com/djeday123/gotorch/tensor"
 
 // backward performs a full backward pass starting from v with the given gradient.
 // It uses a topological sort so that each node's gradient is fully accumulated

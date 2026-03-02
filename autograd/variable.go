@@ -1,6 +1,6 @@
 package autograd
 
-import "gotorch_v1/tensor"
+import "github.com/djeday123/gotorch/tensor"
 
 // GradFn is implemented by every differentiable operation.
 // Apply receives the upstream gradient and returns gradients
@@ -35,7 +35,12 @@ func NewResult(t *tensor.Tensor, gradFn GradFn, children ...*Variable) *Variable
 }
 
 // newResult creates an intermediate (non-leaf) Variable produced by an op.
+// When gradient computation is disabled (NoGrad context), the result is a
+// plain leaf Variable with no grad_fn — identical to calling Detach().
 func newResult(t *tensor.Tensor, gradFn GradFn, children ...*Variable) *Variable {
+	if !IsGradEnabled() {
+		return &Variable{Data: t, isLeaf: true}
+	}
 	needsGrad := false
 	for _, c := range children {
 		if c.RequiresGrad {

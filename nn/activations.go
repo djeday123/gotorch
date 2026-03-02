@@ -1,6 +1,6 @@
 package nn
 
-import "gotorch_v1/autograd"
+import "github.com/djeday123/gotorch/autograd"
 
 // ReLULayer is a Module wrapper for the ReLU activation.
 type ReLULayer struct{}

@@ -1,9 +1,9 @@
 package nn
 
 import (
-	"gotorch_v1/autograd"
-	"gotorch_v1/optim"
-	"gotorch_v1/tensor"
+	"github.com/djeday123/gotorch/autograd"
+	"github.com/djeday123/gotorch/optim"
+	"github.com/djeday123/gotorch/tensor"
 	"math"
 	"testing"
 )

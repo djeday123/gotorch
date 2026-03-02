@@ -1,8 +1,8 @@
 package optim
 
 import (
-	"gotorch_v1/autograd"
-	"gotorch_v1/tensor"
+	"github.com/djeday123/gotorch/autograd"
+	"github.com/djeday123/gotorch/tensor"
 	"math"
 )
 

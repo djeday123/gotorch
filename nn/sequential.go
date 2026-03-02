@@ -1,6 +1,6 @@
 package nn
 
-import "gotorch_v1/autograd"
+import "github.com/djeday123/gotorch/autograd"
 
 // Sequential chains multiple Modules, passing the output of each as input to the next.
 type Sequential struct {

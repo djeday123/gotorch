@@ -3,7 +3,16 @@ package tensor
 import "fmt"
 
 // ContiguousCopy returns a new contiguous tensor with the same logical data.
+// Preserves dtype.
 func (t *Tensor) ContiguousCopy() *Tensor {
+	if t.dtype == Float32 {
+		out := ZerosF32(t.shape...)
+		it := newIterator(t)
+		for i := 0; it.hasNext(); i++ {
+			out.f32[i] = t.f32[it.next()]
+		}
+		return out
+	}
 	out := Zeros(t.shape...)
 	it := newIterator(t)
 	for i := 0; it.hasNext(); i++ {

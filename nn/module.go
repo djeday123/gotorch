@@ -1,6 +1,6 @@
 package nn
 
-import "gotorch_v1/autograd"
+import "github.com/djeday123/gotorch/autograd"
 
 // Module is the base interface for all neural network layers.
 type Module interface {

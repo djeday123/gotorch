@@ -148,6 +148,98 @@ func TestPinnedToCPUTensor(t *testing.T) {
 	}
 }
 
-// NOTE: Transfer benchmarks (BenchmarkPinnedH2D / BenchmarkPageableH2D) are
-// excluded — cudaDeviceSynchronize triggers the CUDA TDR watchdog on display
-// GPUs (RTX 4090 under X11). Run on a compute-only / headless GPU to benchmark.
+// BenchmarkPinnedH2D — async DMA from pinned memory (zero-copy path).
+// BenchmarkPageableH2D — regular pageable memcpy (standard Upload path).
+// Both pre-allocate GPU buffer outside the loop to isolate pure transfer time.
+
+func BenchmarkPinnedH2D(b *testing.B) {
+	if _, err := Init(0); err != nil {
+		b.Skip("no GPU:", err)
+	}
+	const n = 1_000_000
+	p, err := NewPinnedTensor(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer p.Free()
+	sl := p.Slice()
+	for i := range sl {
+		sl[i] = float64(i)
+	}
+	g, err := NewGPUTensorEmpty(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer g.Free()
+
+	b.ResetTimer()
+	b.SetBytes(n * 8)
+	for i := 0; i < b.N; i++ {
+		H2DAsync(g, p)
+	}
+}
+
+func BenchmarkPageableH2D(b *testing.B) {
+	if _, err := Init(0); err != nil {
+		b.Skip("no GPU:", err)
+	}
+	const n = 1_000_000
+	data := make([]float64, n)
+	for i := range data {
+		data[i] = float64(i)
+	}
+	g, err := NewGPUTensorEmpty(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer g.Free()
+
+	b.ResetTimer()
+	b.SetBytes(n * 8)
+	for i := 0; i < b.N; i++ {
+		// cudaMemcpy is synchronous — no extra sync needed
+		H2D(g.ptr, data)
+	}
+}
+
+func BenchmarkPinnedD2H(b *testing.B) {
+	if _, err := Init(0); err != nil {
+		b.Skip("no GPU:", err)
+	}
+	const n = 1_000_000
+	p, err := NewPinnedTensor(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer p.Free()
+	g, err := NewGPUTensorEmpty(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer g.Free()
+
+	b.ResetTimer()
+	b.SetBytes(n * 8)
+	for i := 0; i < b.N; i++ {
+		D2HAsync(p, g)
+	}
+}
+
+func BenchmarkPageableD2H(b *testing.B) {
+	if _, err := Init(0); err != nil {
+		b.Skip("no GPU:", err)
+	}
+	const n = 1_000_000
+	dst := make([]float64, n)
+	g, err := NewGPUTensorEmpty(n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer g.Free()
+
+	b.ResetTimer()
+	b.SetBytes(n * 8)
+	for i := 0; i < b.N; i++ {
+		D2H(dst, g.ptr, n)
+	}
+}

@@ -16,7 +16,7 @@ package cuda
 
 import (
 	"fmt"
-	"gotorch_v1/tensor"
+	"github.com/djeday123/gotorch/tensor"
 )
 
 // GPUBackend manages a CUDA device and exposes high-level tensor ops.

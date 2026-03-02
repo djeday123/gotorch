@@ -4,7 +4,7 @@ package cuda
 
 import (
 	"fmt"
-	"gotorch_v1/tensor"
+	"github.com/djeday123/gotorch/tensor"
 	"unsafe"
 )
 
