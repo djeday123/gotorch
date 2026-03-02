@@ -1,3 +1,3 @@
-module gotorch_v1
+module github.com/djeday123/gotorch
 
 go 1.22.2
