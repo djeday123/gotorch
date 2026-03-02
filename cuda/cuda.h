@@ -19,6 +19,13 @@ void  gpu_free(void *ptr);
 void  gpu_memcpy_h2d(void *dst, const void *src, size_t bytes);
 void  gpu_memcpy_d2h(void *dst, const void *src, size_t bytes);
 
+// Pinned (page-locked) host memory — zero-copy CPU↔GPU transfers
+void *gpu_alloc_pinned(size_t bytes);
+void  gpu_free_pinned(void *ptr);
+void  gpu_memcpy_h2d_async(void *dst_gpu, const void *src_pinned, size_t bytes);
+void  gpu_memcpy_d2h_async(void *dst_pinned, const void *src_gpu, size_t bytes);
+void  gpu_stream_sync(void);
+
 // Elementwise ops (double / float64)
 void gpu_add_f64(const double *a, const double *b, double *c, int n);
 void gpu_sub_f64(const double *a, const double *b, double *c, int n);

@@ -4,7 +4,7 @@ package cuda
 
 /*
 #cgo CFLAGS: -I.
-#cgo LDFLAGS: -L. -lgotorch_cuda -lcublas -lcudart -Wl,-rpath,.
+#cgo LDFLAGS: -L. -lgotorch_cuda -lcublas -lcudart
 #include "cuda.h"
 #include <stdlib.h>
 */

@@ -104,6 +104,32 @@ extern "C" void gpu_memcpy_d2h(void *dst, const void *src, size_t bytes) {
 }
 
 // ---------------------------------------------------------------------------
+// Pinned (page-locked) memory — zero-copy CPU↔GPU
+// ---------------------------------------------------------------------------
+
+extern "C" void *gpu_alloc_pinned(size_t bytes) {
+    void *ptr = NULL;
+    CUDA_CHECK(cudaMallocHost(&ptr, bytes));
+    return ptr;
+}
+
+extern "C" void gpu_free_pinned(void *ptr) {
+    if (ptr) cudaFreeHost(ptr);
+}
+
+extern "C" void gpu_memcpy_h2d_async(void *dst_gpu, const void *src_pinned, size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst_gpu, src_pinned, bytes, cudaMemcpyHostToDevice, 0));
+}
+
+extern "C" void gpu_memcpy_d2h_async(void *dst_pinned, const void *src_gpu, size_t bytes) {
+    CUDA_CHECK(cudaMemcpyAsync(dst_pinned, src_gpu, bytes, cudaMemcpyDeviceToHost, 0));
+}
+
+extern "C" void gpu_stream_sync(void) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ---------------------------------------------------------------------------
 // Elementwise kernels
 // ---------------------------------------------------------------------------
 
