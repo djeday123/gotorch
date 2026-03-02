@@ -54,3 +54,6 @@ func (s *SGD) ZeroGrad() {
 		p.Grad = nil
 	}
 }
+
+func (s *SGD) SetLR(lr float64) { s.lr = lr }
+func (s *SGD) GetLR() float64   { return s.lr }

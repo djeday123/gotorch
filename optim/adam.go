@@ -60,3 +60,6 @@ func (a *Adam) ZeroGrad() {
 		p.Grad = nil
 	}
 }
+
+func (a *Adam) SetLR(lr float64) { a.lr = lr }
+func (a *Adam) GetLR() float64   { return a.lr }
