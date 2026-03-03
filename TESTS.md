@@ -1,6 +1,6 @@
 # GoTorch — Test Suite
 
-**85 tests · all passing · v1.1.0**
+**221 tests · all passing · v2.1.0**
 
 Run all:
 ```bash
@@ -188,3 +188,53 @@ go test -tags gpu ./cuda/...
 | `BenchmarkPageableD2H` | pageable D2H (8 MB) |
 
 Results on RTX 4090 vs PyTorch 2.10 — within measurement noise (< 2% difference).
+
+---
+
+## `tensor` — Level 5 (11 tests)
+
+| Test | What it verifies |
+|---|---|
+| `TestGatherDim0` | gather along dim=0, picks rows by index |
+| `TestGatherDim1` | gather along dim=1, picks columns by index |
+| `TestScatterAdd` | scatter-add accumulates into correct positions |
+| `TestCumsumDim1` | cumulative sum along rows |
+| `TestCumsumDim0` | cumulative sum along columns |
+| `TestCumprodDim1` | cumulative product along rows |
+| `TestTril` | lower triangular mask (main diagonal) |
+| `TestTrilPositiveDiag` | lower triangular with +1 diagonal offset |
+| `TestTriu` | upper triangular mask |
+| `TestRepeatInterleaveDim0` | repeat-interleave [1,2,3]→[1,1,2,2,3,3] |
+| `TestRepeatInterleave2D` | repeat-interleave along dim=1 for 2D tensor |
+
+---
+
+## `nn` — Level 5 (25 tests)
+
+| Test | What it verifies |
+|---|---|
+| `TestFunctionalReLU` | F.ReLU forward + gradient |
+| `TestFunctionalGELU` | F.GELU value at 0 and 1 |
+| `TestFunctionalLeakyReLU` | F.LeakyReLU negative/positive branches |
+| `TestFunctionalSiLU` | F.SiLU values at 0 and 2 |
+| `TestFunctionalSoftmax` | F.Softmax probs sum to 1 per row |
+| `TestFunctionalLogSoftmax` | F.LogSoftmax: exp(output) sums to 1 |
+| `TestFunctionalDropout` | F.Dropout eval mode is no-op |
+| `TestFunctionalMSELoss` | F.MSELoss matches nn.MSELoss value |
+| `TestFunctionalL1Loss` | F.L1Loss = mean(|pred-target|) |
+| `TestFunctionalHuberLoss` | F.HuberLoss near-0 (L2) and far (L1) |
+| `TestFunctionalCrossEntropy` | F.CrossEntropyLoss matches nn.CrossEntropyLoss |
+| `TestFunctionalNLLLoss` | F.NLLLoss = -mean(logProbs at targets) |
+| `TestL1LossLayer` | nn.L1Loss value + gradient sign check |
+| `TestHuberLossLayer` | nn.HuberLoss value + backward |
+| `TestNLLLossLayer` | nn.NLLLoss value + backward |
+| `TestKLDivLossLayer` | KLDivLoss(p\|\|p)=0, KLDiv different dists > 0 |
+| `TestConvTranspose2dShape` | output shape = (H-1)*s - 2*p + k |
+| `TestConvTranspose2dBackward` | gradients flow to input and weight |
+| `TestConvTranspose2dStrided` | stride=2 produces correct output shape |
+| `TestUpsampleNearest` | shape = input * scaleFactor, values correct |
+| `TestUpsampleBackward` | gradient flows back through upsample |
+| `TestModuleList` | collects params, forward chains modules |
+| `TestModuleListAppend` | Append grows the list |
+| `TestModelSummary` | TotalParams matches expected count |
+| `TestModelSummaryPrint` | PrintSummary doesn't panic |

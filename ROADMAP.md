@@ -50,22 +50,38 @@
 - [ ] `nn.TransformerEncoderLayer` — Attention + FFN + LayerNorm + Dropout
 - [ ] `nn.TransformerEncoder(layer, numLayers)`
 
-## 🔮 v2.0.0 — Level 4: Production (~95% PyTorch coverage)
-- float16 / bfloat16 + mixed precision training
-- DataLoader — batching, shuffle, prefetch
-- Multi-GPU (DataParallel)
+## ✅ v2.0.0 — Level 4: Production DataLoader + AMP (~92% PyTorch coverage)
+- **tensor** — Std, Var, Norm, Prod, Floor, Ceil, Round, Sign, Linspace, Full
+- **nn** — GELU, LeakyReLU, ELU, SiLU, Conv1d, AdaptiveAvgPool2d
+- **optim** — RMSprop, Adadelta
+- **data/** — Dataset interface, TensorDataset, DataLoader (goroutines, prefetch)
+- **amp/** — GradScaler for mixed precision
+
+## ✅ v2.1.0 — Level 5: Functional API + Advanced Ops (~95% PyTorch coverage)
+- **nn/functional** — F.ReLU/GELU/LeakyReLU/ELU/SiLU/Sigmoid/Tanh, F.Softmax, F.LogSoftmax,
+  F.Dropout, F.MSELoss, F.L1Loss, F.HuberLoss, F.BCELoss, F.CrossEntropyLoss, F.NLLLoss, F.Linear
+- **tensor** — Gather, ScatterAdd, Cumsum, Cumprod, Tril, Triu, RepeatInterleave
+- **nn** — ConvTranspose2d (transposed conv, full backward), Upsample (nearest-neighbor)
+- **nn** — L1Loss, HuberLoss, NLLLoss (public), KLDivLoss
+- **nn** — ModuleList, ModelSummary / PrintSummary
+
+## 🔮 v3.0.0 — Level 6: Distributed + Quantization
+- Multi-GPU DataParallel
+- float16 / bfloat16 dtype (full)
+- int8 Quantization
+- ONNX export (basic graph)
 - `torch.compile` equivalent (kernel fusion)
-- Sparse tensors
-- torch.distributed
+- torch.distributed / NCCL backend
 
 ---
 
 ## Coverage Progress
 
-| Version | Coverage | Unlocks |
-|---|---|---|
-| v1.0.0 | ~25% | XOR, simple feedforward nets |
-| v1.1.0 | ~45% | LeNet, VGG-style CNNs |
-| v1.2.0 | ~65% | ResNet, stable deep training, model persistence |
-| v1.3.0 | ~80% | Transformers, GPT-mini, seq2seq |
-| v2.0.0 | ~95% | Production ML pipelines |
+| Version | Tests | Coverage | Unlocks |
+|---|---|---|---|
+| v1.0.0 | ~25 | ~25% | XOR, simple feedforward nets |
+| v1.1.0 | 85 | ~45% | LeNet, VGG-style CNNs |
+| v1.2.0 | ~110 | ~65% | ResNet, stable deep training, model persistence |
+| v1.3.0 | ~140 | ~80% | Transformers, GPT-mini, seq2seq |
+| v2.0.0 | 185 | ~92% | Production ML pipelines, mixed precision |
+| v2.1.0 | 221 | ~95% | Functional API, deconvolution, upsampling, KL/Huber loss |

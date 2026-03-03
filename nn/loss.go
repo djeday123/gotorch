@@ -1,6 +1,8 @@
 package nn
 
 import (
+	"math"
+
 	"github.com/djeday123/gotorch/autograd"
 	"github.com/djeday123/gotorch/tensor"
 )
@@ -77,5 +79,133 @@ type nllBackward struct{ grad *tensor.Tensor }
 func (f *nllBackward) Apply(upstreamGrad *tensor.Tensor) []*tensor.Tensor {
 	// upstream is a scalar; scale our precomputed gradient
 	scale := upstreamGrad.Item()
+	return []*tensor.Tensor{tensor.MulScalar(f.grad, scale)}
+}
+
+// NLLLoss computes Negative Log-Likelihood loss (exported version).
+// logProbs shape: (N, C), targets: class indices (N,).
+func NLLLoss(logProbs *autograd.Variable, targets []int) *autograd.Variable {
+	return nllLoss(logProbs, targets)
+}
+
+// L1Loss computes mean absolute error: mean(|pred - target|).
+func L1Loss(pred, target *autograd.Variable) *autograd.Variable {
+	predD := pred.Data.Data()
+	targD := target.Data.Data()
+	n := len(predD)
+	diffD := make([]float64, n)
+	sum := 0.0
+	for i := range predD {
+		d := predD[i] - targD[i]
+		diffD[i] = d
+		if d < 0 {
+			sum -= d
+		} else {
+			sum += d
+		}
+	}
+	diffT := tensor.New(diffD, pred.Data.Shape())
+	return autograd.NewResult(tensor.Scalar(sum/float64(n)), &l1LossBackward{diffT, n}, pred, target)
+}
+
+type l1LossBackward struct {
+	diff *tensor.Tensor
+	n    int
+}
+
+func (f *l1LossBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	scale := grad.Item() / float64(f.n)
+	gd := f.diff.Data()
+	out := make([]float64, len(gd))
+	for i, v := range gd {
+		if v > 0 {
+			out[i] = scale
+		} else if v < 0 {
+			out[i] = -scale
+		}
+	}
+	neg := make([]float64, len(out))
+	for i, v := range out {
+		neg[i] = -v
+	}
+	return []*tensor.Tensor{tensor.New(out, f.diff.Shape()), tensor.New(neg, f.diff.Shape())}
+}
+
+// HuberLoss (smooth L1) loss with delta parameter.
+// For |x| <= delta: 0.5 * x^2 / delta
+// For |x| > delta:  |x| - 0.5 * delta
+func HuberLoss(pred, target *autograd.Variable, delta float64) *autograd.Variable {
+	predD := pred.Data.Data()
+	targD := target.Data.Data()
+	n := len(predD)
+	diffD := make([]float64, n)
+	sum := 0.0
+	for i := range predD {
+		d := predD[i] - targD[i]
+		diffD[i] = d
+		abs := math.Abs(d)
+		if abs <= delta {
+			sum += 0.5 * d * d / delta
+		} else {
+			sum += abs - 0.5*delta
+		}
+	}
+	diffT := tensor.New(diffD, pred.Data.Shape())
+	return autograd.NewResult(tensor.Scalar(sum/float64(n)), &huberLossBackward{diffT, delta, n}, pred, target)
+}
+
+type huberLossBackward struct {
+	diff  *tensor.Tensor
+	delta float64
+	n     int
+}
+
+func (f *huberLossBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	scale := grad.Item() / float64(f.n)
+	gd := f.diff.Data()
+	out := make([]float64, len(gd))
+	for i, v := range gd {
+		if math.Abs(v) <= f.delta {
+			out[i] = scale * v / f.delta
+		} else if v > 0 {
+			out[i] = scale
+		} else {
+			out[i] = -scale
+		}
+	}
+	neg := make([]float64, len(out))
+	for i, v := range out {
+		neg[i] = -v
+	}
+	return []*tensor.Tensor{tensor.New(out, f.diff.Shape()), tensor.New(neg, f.diff.Shape())}
+}
+
+// KLDivLoss computes element-wise KL divergence: mean(target * (log(target) - input)).
+// input should be log-probabilities (e.g. output of LogSoftmax).
+// target should be probabilities (positive values summing to 1).
+func KLDivLoss(input, target *autograd.Variable) *autograd.Variable {
+	inputD := input.Data.Data()
+	targetD := target.Data.Data()
+	n := len(inputD)
+	sum := 0.0
+	for i := range inputD {
+		t := targetD[i]
+		if t > 0 {
+			sum += t * (math.Log(t) - inputD[i])
+		}
+	}
+	loss := sum / float64(n)
+	// Gradient w.r.t. input: -target / n
+	gradIn := make([]float64, n)
+	for i, t := range targetD {
+		gradIn[i] = -t / float64(n)
+	}
+	return autograd.NewResult(tensor.Scalar(loss), &klDivBackward{tensor.New(gradIn, input.Data.Shape())}, input)
+}
+
+type klDivBackward struct{ grad *tensor.Tensor }
+
+func (f *klDivBackward) Apply(upstream *tensor.Tensor) []*tensor.Tensor {
+	scale := upstream.Item()
 	return []*tensor.Tensor{tensor.MulScalar(f.grad, scale)}
 }
