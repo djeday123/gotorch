@@ -33,10 +33,63 @@ func BCELoss(pred, target *autograd.Variable) *autograd.Variable {
 
 // CrossEntropyLoss computes cross-entropy loss from raw logits and integer class targets.
 // logits shape: (N, C), targets shape: (N,) with values in [0, C).
-// Uses LogSoftmax + NLLLoss for numerical stability.
+//
+// Uses numerically stable log-sum-exp and direct gradient:
+//   d_loss/d_logits[i,j] = (softmax(logits)[i,j] - 1{j==target[i]}) / N
 func CrossEntropyLoss(logits *autograd.Variable, targets []int) *autograd.Variable {
-	logSoft := logSoftmax(logits, 1) // (N, C)
-	return nllLoss(logSoft, targets)
+	N := len(targets)
+	shape := logits.Data.Shape() // [N, C]
+	C := shape[1]
+
+	logitsD := logits.Data.Data()
+
+	// Compute softmax in numerically stable way + NLL loss
+	totalLoss := 0.0
+	softmaxD := make([]float64, N*C)
+
+	for i := 0; i < N; i++ {
+		row := logitsD[i*C : (i+1)*C]
+		// Max for stability
+		maxVal := row[0]
+		for _, v := range row {
+			if v > maxVal {
+				maxVal = v
+			}
+		}
+		// exp(x - max)
+		sumExp := 0.0
+		for j, v := range row {
+			e := math.Exp(v - maxVal)
+			softmaxD[i*C+j] = e
+			sumExp += e
+		}
+		// Normalize
+		for j := range row {
+			softmaxD[i*C+j] /= sumExp
+		}
+		// NLL loss for target class
+		totalLoss += -math.Log(softmaxD[i*C+targets[i]] + 1e-12)
+	}
+	loss := totalLoss / float64(N)
+
+	// Gradient: (softmax[i,j] - 1{j==target[i]}) / N
+	gradD := make([]float64, N*C)
+	for i := 0; i < N; i++ {
+		for j := 0; j < C; j++ {
+			gradD[i*C+j] = softmaxD[i*C+j] / float64(N)
+		}
+		gradD[i*C+targets[i]] -= 1.0 / float64(N)
+	}
+	gradT := tensor.New(gradD, []int{N, C})
+
+	return autograd.NewResult(tensor.Scalar(loss), &crossEntropyBackward{gradT}, logits)
+}
+
+type crossEntropyBackward struct{ grad *tensor.Tensor }
+
+func (f *crossEntropyBackward) Apply(upstream *tensor.Tensor) []*tensor.Tensor {
+	scale := upstream.Item()
+	return []*tensor.Tensor{tensor.MulScalar(f.grad, scale)}
 }
 
 // logSoftmax computes log(softmax(x)) in a numerically stable way.
