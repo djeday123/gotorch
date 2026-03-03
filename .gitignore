@@ -1,1 +1,5 @@
-01_xor\n02_mnist_mlp\n06_functional\n*.so\n*.o
+01_xor
+02_mnist_mlp
+06_functional
+*.so
+*.o
