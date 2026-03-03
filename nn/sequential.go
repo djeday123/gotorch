@@ -36,3 +36,7 @@ func (s *Sequential) ZeroGrad() {
 		l.ZeroGrad()
 	}
 }
+
+// GetLayers returns the ordered list of child modules.
+// Primarily used by export utilities (e.g. export.ExportONNX).
+func (s *Sequential) GetLayers() []Module { return s.layers }
