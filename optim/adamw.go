@@ -73,3 +73,35 @@ func (a *AdamW) Step() {
 
 func (a *AdamW) SetLR(lr float64) { a.lr = lr }
 func (a *AdamW) GetLR() float64   { return a.lr }
+
+// AdamWState holds serialisable snapshot of AdamW internal state.
+type AdamWState struct {
+	Type        string      `json:"type"`
+	Step        int         `json:"step"`
+	LR          float64     `json:"lr"`
+	Beta1       float64     `json:"beta1"`
+	Beta2       float64     `json:"beta2"`
+	Eps         float64     `json:"eps"`
+	WeightDecay float64     `json:"weight_decay"`
+	M           [][]float64 `json:"m"`
+	V           [][]float64 `json:"v"`
+}
+
+func (a *AdamW) GetState() AdamWState {
+	return AdamWState{
+		Type: "adamw", Step: a.step, LR: a.lr,
+		Beta1: a.beta1, Beta2: a.beta2, Eps: a.eps,
+		WeightDecay: a.weightDecay, M: a.m, V: a.v,
+	}
+}
+
+func (a *AdamW) SetState(s AdamWState) {
+	a.step = s.Step
+	a.lr = s.LR
+	a.beta1 = s.Beta1
+	a.beta2 = s.Beta2
+	a.eps = s.Eps
+	a.weightDecay = s.WeightDecay
+	a.m = s.M
+	a.v = s.V
+}
