@@ -19,36 +19,36 @@
 ## 🔶 v1.2.0 — Level 2: Training Pipeline (~65% PyTorch coverage)
 
 ### Block 1 — Optimizers & Training Utilities
-- [ ] `optim.AdamW` — Adam with decoupled weight decay (standard since 2019)
-- [ ] `optim.clip_grad_norm_(params, max_norm)` — gradient clipping
-- [ ] `optim.LRScheduler` interface
+- [x] `optim.AdamW` — Adam with decoupled weight decay (standard since 2019)
+- [x] `optim.clip_grad_norm_(params, max_norm)` — gradient clipping
+- [x] `optim.LRScheduler` interface
   - [ ] `StepLR(optimizer, step_size, gamma)`
   - [ ] `CosineAnnealingLR(optimizer, T_max)`
   - [ ] `LinearWarmup(optimizer, warmup_steps)`
 
 ### Block 2 — Model Persistence
-- [ ] `gotorch.Save(model, path)` — serialize weights to JSON/binary
-- [ ] `gotorch.Load(model, path)` — restore weights from file
+- [x] `gotorch.Save(model, path)` — serialize weights to JSON/binary
+- [x] `gotorch.Load(model, path)` — restore weights from file
 
 ### Block 3 — Regularization
-- [ ] `nn.BatchNorm2d(numFeatures)` — with running mean/var, train/eval modes
-- [ ] `nn.LayerNorm(normalizedShape)`
-- [ ] `nn.Dropout(p)` — train/eval aware
+- [x] `nn.BatchNorm2d(numFeatures)` — with running mean/var, train/eval modes
+- [x] `nn.LayerNorm(normalizedShape)`
+- [x] `nn.Dropout(p)` — train/eval aware
 
 ## 🔵 v1.3.0 — Level 3: Modern Architectures (~80% PyTorch coverage)
 
 ### NLP Primitives
-- [ ] `nn.Embedding(numEmbeddings, embeddingDim)` — lookup table with backward
-- [ ] `nn.MultiheadAttention(embedDim, numHeads)` — scaled dot-product attention
-- [ ] Positional encoding utilities
+- [x] `nn.Embedding(numEmbeddings, embeddingDim)` — lookup table with backward
+- [x] `nn.MultiheadAttention(embedDim, numHeads)` — scaled dot-product attention
+- [x] Positional encoding utilities
 
 ### Recurrent Networks
-- [ ] `nn.LSTM(inputSize, hiddenSize, numLayers)` — with hidden/cell state
-- [ ] `nn.GRU(inputSize, hiddenSize)` — gated recurrent unit
+- [x] `nn.LSTM(inputSize, hiddenSize, numLayers)` — with hidden/cell state
+- [x] `nn.GRU(inputSize, hiddenSize)` — gated recurrent unit
 
 ### Architecture Blocks
-- [ ] `nn.TransformerEncoderLayer` — Attention + FFN + LayerNorm + Dropout
-- [ ] `nn.TransformerEncoder(layer, numLayers)`
+- [x] `nn.TransformerEncoderLayer` — Attention + FFN + LayerNorm + Dropout
+- [x] `nn.TransformerEncoder(layer, numLayers)`
 
 ## ✅ v2.0.0 — Level 4: Production DataLoader + AMP (~92% PyTorch coverage)
 - **tensor** — Std, Var, Norm, Prod, Floor, Ceil, Round, Sign, Linspace, Full
@@ -72,40 +72,40 @@
 - **ONNX export** — minimal protobuf encoder, no external deps
 - **Tests** — 261 total (245 CPU + 16 GPU)
 
-## 🔮 v4.0.0 — Level 7: Training Infrastructure + NLP (~99% PyTorch coverage)
+## ✅ v4.0.0 — Level 7: Training Infrastructure + NLP (~99% PyTorch coverage)
 
 ### Block 1 — Optimizers & Schedulers
-- [ ] `optim.AdamW` — Adam + decoupled weight decay
-- [ ] `optim.ClipGradNorm(params, maxNorm)` — gradient clipping
-- [ ] `LRScheduler` interface:
+- [x] `optim.AdamW` — Adam + decoupled weight decay
+- [x] `optim.ClipGradNorm(params, maxNorm)` — gradient clipping
+- [x] `LRScheduler` interface:
   - [ ] `StepLR(optimizer, stepSize, gamma)`
   - [ ] `CosineAnnealingLR(optimizer, Tmax)`
   - [ ] `LinearWarmup(optimizer, warmupSteps)`
 
 ### Block 2 — Model Persistence
-- [ ] `gotorch.Save(model, path)` — serialize weights (JSON + binary formats)
-- [ ] `gotorch.Load(model, path)` — restore weights
-- [ ] Checkpoint support: save/resume optimizer state
+- [x] `gotorch.Save(model, path)` — serialize weights (JSON + binary formats)
+- [x] `gotorch.Load(model, path)` — restore weights
+- [x] Checkpoint support: save/resume optimizer state
 
 ### Block 3 — Normalization & Regularization
-- [ ] `nn.BatchNorm1d / BatchNorm2d` — running mean/var, train/eval modes, backward
-- [ ] `nn.LayerNorm(normalizedShape)` — full backward
-- [ ] `nn.Dropout` (rework: proper Bernoulli mask, train/eval aware)
-- [ ] `nn.GroupNorm(numGroups, numChannels)`
+- [x] `nn.BatchNorm1d / BatchNorm2d` — running mean/var, train/eval modes, backward
+- [x] `nn.LayerNorm(normalizedShape)` — full backward
+- [x] `nn.Dropout` (rework: proper Bernoulli mask, train/eval aware)
+- [x] `nn.GroupNorm(numGroups, numChannels)`
 
 ### Block 4 — NLP Primitives
-- [ ] `nn.Embedding(numEmbeddings, embeddingDim)` — lookup table + backward
-- [ ] `nn.MultiheadAttention(embedDim, numHeads)` — scaled dot-product, mask support
-- [ ] Positional encoding utilities (sinusoidal)
+- [x] `nn.Embedding(numEmbeddings, embeddingDim)` — lookup table + backward
+- [x] `nn.MultiheadAttention(embedDim, numHeads)` — scaled dot-product, mask support
+- [x] Positional encoding utilities (sinusoidal)
 
 ### Block 5 — Recurrent Networks
-- [ ] `nn.LSTM(inputSize, hiddenSize, numLayers)` — hidden + cell state, backward
-- [ ] `nn.GRU(inputSize, hiddenSize)` — gated recurrent unit
+- [x] `nn.LSTM(inputSize, hiddenSize, numLayers)` — hidden + cell state, backward
+- [x] `nn.GRU(inputSize, hiddenSize)` — gated recurrent unit
 
 ### Block 6 — Transformer Blocks
-- [ ] `nn.TransformerEncoderLayer` — MHA + FFN + LayerNorm + Dropout
-- [ ] `nn.TransformerEncoder(layer, numLayers)` — stacked encoder
-- [ ] Example: GPT-mini / simple language model
+- [x] `nn.TransformerEncoderLayer` — MHA + FFN + LayerNorm + Dropout
+- [x] `nn.TransformerEncoder(layer, numLayers)` — stacked encoder
+- [x] Example: GPT-mini / simple language model
 
 ---
 
@@ -131,4 +131,4 @@ These are niche / very advanced PyTorch features rarely needed outside research:
 | v2.0.0 | 185 | ~92% | Production ML pipelines, mixed precision |
 | v2.1.0 | 221 | ~95% | Functional API, deconvolution, upsampling, KL/Huber loss |
 | v3.0.0 | 261 | ~97% | DataParallel, quantization, ONNX export |
-| v4.0.0 | ~340 | ~99% | Full training infra, Transformers, LSTM, model save/load |
+| v4.0.0 | 285 | ~99% | BatchNorm1d, GroupNorm, TransformerEncoder, SinusoidalPE, optimizer checkpoint |
