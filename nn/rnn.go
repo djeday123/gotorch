@@ -354,3 +354,41 @@ func tanh1D(x []float64) []float64 {
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// ForwardSequence helpers for StackedLSTM / StackedGRU
+// ---------------------------------------------------------------------------
+
+// ForwardSequence runs LSTM over x [T, inputSize] with explicit h0/c0.
+// Returns (finalH, finalC, outputs [T, hiddenSize]).
+func (l *LSTM) ForwardSequence(x, h0, c0 *autograd.Variable) (*autograd.Variable, *autograd.Variable, *autograd.Variable) {
+	var state *LSTMState
+	if h0 != nil {
+		state = &LSTMState{H: h0, C: c0}
+	}
+	outputs, finalState := l.Forward(x, state)
+	return finalState.H, finalState.C, stackOutputs(outputs, l.HiddenSize)
+}
+
+// ForwardSequence runs GRU over x [T, inputSize] with explicit h0.
+// Returns (finalH, outputs [T, hiddenSize]).
+func (g *GRU) ForwardSequence(x, h0 *autograd.Variable) (*autograd.Variable, *autograd.Variable) {
+	outputs := g.Forward(x, h0)
+	return outputs[len(outputs)-1], stackOutputs(outputs, g.HiddenSize)
+}
+
+// stackOutputs concatenates a [T] slice of [H] variables into [T, H].
+func stackOutputs(outs []*autograd.Variable, hiddenSize int) *autograd.Variable {
+	T := len(outs)
+	data := make([]float64, T*hiddenSize)
+	for t, o := range outs {
+		od := o.Data.Data()
+		copy(data[t*hiddenSize:], od[:hiddenSize])
+	}
+	return autograd.NewVar(tensor.New(data, []int{T, hiddenSize}), false)
+}
+
+// zerosTensor1D returns a 1D zeros tensor of size n.
+func zerosTensor1D(n int) *tensor.Tensor {
+	return tensor.Zeros(n)
+}
