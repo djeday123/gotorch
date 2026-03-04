@@ -65,13 +65,60 @@
 - **nn** — L1Loss, HuberLoss, NLLLoss (public), KLDivLoss
 - **nn** — ModuleList, ModelSummary / PrintSummary
 
-## 🔮 v3.0.0 — Level 6: Distributed + Quantization
-- Multi-GPU DataParallel
-- float16 / bfloat16 dtype (full)
-- int8 Quantization
-- ONNX export (basic graph)
-- `torch.compile` equivalent (kernel fusion)
-- torch.distributed / NCCL backend
+## ✅ v3.0.0 — Level 6: Distributed + Quantization (~97% PyTorch coverage)
+- **DataParallel** — multi-GPU split/gather API (1-GPU pass-through + multi-GPU)
+- **Dtypes** — Float16, BFloat16, Int8 (full dtype system)
+- **Quantization** — Quantize8/Dequantize8, QLinear, QuantizeModel
+- **ONNX export** — minimal protobuf encoder, no external deps
+- **Tests** — 261 total (245 CPU + 16 GPU)
+
+## 🔮 v4.0.0 — Level 7: Training Infrastructure + NLP (~99% PyTorch coverage)
+
+### Block 1 — Optimizers & Schedulers
+- [ ] `optim.AdamW` — Adam + decoupled weight decay
+- [ ] `optim.ClipGradNorm(params, maxNorm)` — gradient clipping
+- [ ] `LRScheduler` interface:
+  - [ ] `StepLR(optimizer, stepSize, gamma)`
+  - [ ] `CosineAnnealingLR(optimizer, Tmax)`
+  - [ ] `LinearWarmup(optimizer, warmupSteps)`
+
+### Block 2 — Model Persistence
+- [ ] `gotorch.Save(model, path)` — serialize weights (JSON + binary formats)
+- [ ] `gotorch.Load(model, path)` — restore weights
+- [ ] Checkpoint support: save/resume optimizer state
+
+### Block 3 — Normalization & Regularization
+- [ ] `nn.BatchNorm1d / BatchNorm2d` — running mean/var, train/eval modes, backward
+- [ ] `nn.LayerNorm(normalizedShape)` — full backward
+- [ ] `nn.Dropout` (rework: proper Bernoulli mask, train/eval aware)
+- [ ] `nn.GroupNorm(numGroups, numChannels)`
+
+### Block 4 — NLP Primitives
+- [ ] `nn.Embedding(numEmbeddings, embeddingDim)` — lookup table + backward
+- [ ] `nn.MultiheadAttention(embedDim, numHeads)` — scaled dot-product, mask support
+- [ ] Positional encoding utilities (sinusoidal)
+
+### Block 5 — Recurrent Networks
+- [ ] `nn.LSTM(inputSize, hiddenSize, numLayers)` — hidden + cell state, backward
+- [ ] `nn.GRU(inputSize, hiddenSize)` — gated recurrent unit
+
+### Block 6 — Transformer Blocks
+- [ ] `nn.TransformerEncoderLayer` — MHA + FFN + LayerNorm + Dropout
+- [ ] `nn.TransformerEncoder(layer, numLayers)` — stacked encoder
+- [ ] Example: GPT-mini / simple language model
+
+---
+
+## What's in the remaining ~1% (v5.0.0+)
+These are niche / very advanced PyTorch features rarely needed outside research:
+- `torch.compile` / kernel fusion / JIT tracing
+- `torch.distributed` + NCCL multi-node (beyond single-machine DataParallel)
+- `nn.Transformer` (decoder + cross-attention, full encoder-decoder)
+- Sparse tensors (`torch.sparse`)
+- `torch.fx` graph mode / symbolic tracing
+- Complex number dtype support
+- Custom C++/CUDA extensions API (`torch.utils.cpp_extension`)
+- TorchScript export
 
 ---
 
@@ -81,7 +128,7 @@
 |---|---|---|---|
 | v1.0.0 | ~25 | ~25% | XOR, simple feedforward nets |
 | v1.1.0 | 85 | ~45% | LeNet, VGG-style CNNs |
-| v1.2.0 | ~110 | ~65% | ResNet, stable deep training, model persistence |
-| v1.3.0 | ~140 | ~80% | Transformers, GPT-mini, seq2seq |
 | v2.0.0 | 185 | ~92% | Production ML pipelines, mixed precision |
 | v2.1.0 | 221 | ~95% | Functional API, deconvolution, upsampling, KL/Huber loss |
+| v3.0.0 | 261 | ~97% | DataParallel, quantization, ONNX export |
+| v4.0.0 | ~340 | ~99% | Full training infra, Transformers, LSTM, model save/load |
