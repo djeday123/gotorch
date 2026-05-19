@@ -139,70 +139,61 @@ func addVecBias(x, b *autograd.Variable) *autograd.Variable {
 // multiHeadAttentionSplit splits Q/K/V into heads and computes attention.
 func multiHeadAttentionSplit(Q, K, V *autograd.Variable, numHeads, headDim int, mask *tensor.Tensor) *autograd.Variable {
 	T := Q.Data.Shape()[0]
+	embedDim := numHeads * headDim
 	scale := 1.0 / math.Sqrt(float64(headDim))
 
-	// Process each head independently, concatenate results
-	headOuts := make([]*autograd.Variable, numHeads)
+	attns := make([]*tensor.Tensor, numHeads) // [T, T] per head — saved for backward
+	outData := make([]float64, T*embedDim)
+
 	for h := 0; h < numHeads; h++ {
-		// Slice head: Q_h = Q[:, h*headDim:(h+1)*headDim]
-		Qh := sliceHead(Q, h, headDim)
-		Kh := sliceHead(K, h, headDim)
-		Vh := sliceHead(V, h, headDim)
+		Qh := sliceHeadRaw(Q.Data, h, headDim) // [T, headDim]
+		Kh := sliceHeadRaw(K.Data, h, headDim)
+		Vh := sliceHeadRaw(V.Data, h, headDim)
 
-		// Scores = Q_h @ K_h^T * scale → [T, T]
-		scores := autograd.MatMul(Qh, autograd.NewVar(Kh.Data.T(), false))
-		scores = autograd.NewVar(tensor.MulScalar(scores.Data, scale), false)
+		// scores = Qh @ Kh^T * scale  -> [T, T]
+		scores := tensor.MulScalar(tensor.MatMul(Qh, Kh.T()), scale)
 
-		// Apply mask if provided
+		// apply mask
 		if mask != nil {
-			masked := make([]float64, T*T)
-			sData := scores.Data.Data()
-			mData := mask.Data()
-			for i := range masked {
-				masked[i] = sData[i] + mData[i]
-			}
-			scores = autograd.NewVar(tensor.New(masked, []int{T, T}), false)
+			scores = tensor.Add(scores, mask)
 		}
 
-		// Softmax over last dim
-		attn := autograd.NewVar(softmax2D(scores.Data), false)
+		// softmax over last dim
+		attn := softmax2D(scores)
+		attns[h] = attn
 
-		// Out_h = attn @ V_h → [T, headDim]
-		headOuts[h] = autograd.NewVar(tensor.MatMul(attn.Data, Vh.Data), false)
-	}
-
-	// Concatenate heads: [T, numHeads*headDim] = [T, embedDim]
-	// Build output directly
-	embedDim := numHeads * headDim
-	outData := make([]float64, T*embedDim)
-	for h := 0; h < numHeads; h++ {
-		hData := headOuts[h].Data.Data()
+		// head_out = attn @ Vh -> [T, headDim]
+		headOut := tensor.MatMul(attn, Vh)
+		hData := headOut.Data()
 		for t := 0; t < T; t++ {
 			for d := 0; d < headDim; d++ {
 				outData[t*embedDim+h*headDim+d] = hData[t*headDim+d]
 			}
 		}
 	}
-	// Wrap as non-differentiable (full autograd through heads adds complexity;
-	// gradients flow through the outer WQ/WK/WV/WO projections)
+
 	return autograd.NewResult(
 		tensor.New(outData, []int{T, embedDim}),
-		&mhaConcatBackward{T: T, numHeads: numHeads, headDim: headDim, Q: Q, K: K, V: V, scale: scale, mask: mask},
+		&mhaConcatBackward{
+			T: T, numHeads: numHeads, headDim: headDim,
+			Q: Q.Data, K: K.Data, V: V.Data,
+			attns: attns, scale: scale,
+		},
 		Q, K, V,
 	)
 }
 
-// sliceHead extracts head h from [T, embedDim] → [T, headDim].
-func sliceHead(x *autograd.Variable, h, headDim int) *autograd.Variable {
-	T := x.Data.Shape()[0]
-	embedDim := x.Data.Shape()[1]
+// sliceHeadRaw extracts head h from [T, embedDim] → [T, headDim] (raw tensor).
+func sliceHeadRaw(x *tensor.Tensor, h, headDim int) *tensor.Tensor {
+	T := x.Shape()[0]
+	embedDim := x.Shape()[1]
 	start := h * headDim
 	out := make([]float64, T*headDim)
-	xData := x.Data.Data()
+	xData := x.Data()
 	for t := 0; t < T; t++ {
 		copy(out[t*headDim:], xData[t*embedDim+start:t*embedDim+start+headDim])
 	}
-	return autograd.NewVar(tensor.New(out, []int{T, headDim}), false)
+	return tensor.New(out, []int{T, headDim})
 }
 
 // softmax2D applies softmax over the last dimension of a 2D tensor.
@@ -230,20 +221,94 @@ func softmax2D(t *tensor.Tensor) *tensor.Tensor {
 	return tensor.New(out, []int{rows, cols})
 }
 
-// mhaConcatBackward provides a simplified backward pass for MHA.
-// Gradients are propagated through the linear projections (WQ/WK/WV);
-// the attention weights are treated as constants for simplicity.
+// mhaConcatBackward provides the full backward pass for multi-head attention.
+// Stores attention weights and Q/K/V slices captured during forward.
 type mhaConcatBackward struct {
 	T, numHeads, headDim int
-	Q, K, V              *autograd.Variable
+	Q, K, V              *tensor.Tensor   // [T, embedDim] — input data
+	attns                []*tensor.Tensor // [T, T] per head
 	scale                float64
-	mask                 *tensor.Tensor
 }
 
 func (f *mhaConcatBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
-	// Pass gradient through to Q, K, V proportionally (simplified).
-	// Each gets the full gradient (exact backward requires storing attn weights).
-	return []*tensor.Tensor{grad, grad, grad}
+	embedDim := f.numHeads * f.headDim
+	dQ := make([]float64, f.T*embedDim)
+	dK := make([]float64, f.T*embedDim)
+	dV := make([]float64, f.T*embedDim)
+
+	gradFlat := grad.Data()
+
+	for h := 0; h < f.numHeads; h++ {
+		// Slice grad for this head: dHead [T, headDim]
+		dHeadFlat := make([]float64, f.T*f.headDim)
+		for t := 0; t < f.T; t++ {
+			for d := 0; d < f.headDim; d++ {
+				dHeadFlat[t*f.headDim+d] = gradFlat[t*embedDim+h*f.headDim+d]
+			}
+		}
+		dHead := tensor.New(dHeadFlat, []int{f.T, f.headDim})
+
+		Qh := sliceHeadRaw(f.Q, h, f.headDim)
+		Kh := sliceHeadRaw(f.K, h, f.headDim)
+		Vh := sliceHeadRaw(f.V, h, f.headDim)
+		attn := f.attns[h] // [T, T]
+
+		// head_out = attn @ Vh
+		// dVh    = attn^T @ dHead          -> [T, headDim]
+		// dAttn  = dHead @ Vh^T            -> [T, T]
+		dVh := tensor.MatMul(attn.T(), dHead)
+		dAttn := tensor.MatMul(dHead, Vh.T())
+
+		// softmax backward (row-wise): dS_i = s_i * (g_i - sum_j(g_j*s_j))
+		dScores := softmaxBackward2D(dAttn, attn)
+
+		// scores = Qh @ Kh^T * scale
+		// dQh = dScores @ Kh * scale       -> [T, headDim]
+		// dKh = dScores^T @ Qh * scale     -> [T, headDim]
+		dQh := tensor.MulScalar(tensor.MatMul(dScores, Kh), f.scale)
+		dKh := tensor.MulScalar(tensor.MatMul(dScores.T(), Qh), f.scale)
+
+		// Write head gradients back into dQ / dK / dV
+		dQhData := dQh.Data()
+		dKhData := dKh.Data()
+		dVhData := dVh.Data()
+		for t := 0; t < f.T; t++ {
+			for d := 0; d < f.headDim; d++ {
+				idx := t*embedDim + h*f.headDim + d
+				dQ[idx] = dQhData[t*f.headDim+d]
+				dK[idx] = dKhData[t*f.headDim+d]
+				dV[idx] = dVhData[t*f.headDim+d]
+			}
+		}
+	}
+
+	shape := []int{f.T, embedDim}
+	return []*tensor.Tensor{
+		tensor.New(dQ, shape),
+		tensor.New(dK, shape),
+		tensor.New(dV, shape),
+	}
+}
+
+// softmaxBackward2D computes gradient through row-wise softmax of a [R, C] tensor.
+// Given upstream g [R, C] and softmax output s [R, C], returns dS [R, C] where
+// dS_i = s_i * (g_i - sum_j(g_j * s_j)) per row.
+func softmaxBackward2D(g, s *tensor.Tensor) *tensor.Tensor {
+	rows, cols := s.Shape()[0], s.Shape()[1]
+	gData := g.Data()
+	sData := s.Data()
+	out := make([]float64, rows*cols)
+	for r := 0; r < rows; r++ {
+		base := r * cols
+		dot := 0.0
+		for c := 0; c < cols; c++ {
+			dot += gData[base+c] * sData[base+c]
+		}
+		for c := 0; c < cols; c++ {
+			out[base+c] = sData[base+c] * (gData[base+c] - dot)
+		}
+	}
+	return tensor.New(out, []int{rows, cols})
 }
 
 // ---------------------------------------------------------------------------

@@ -71,59 +71,246 @@ type LSTMState struct {
 // Forward runs the LSTM over sequence x [T, inputSize].
 // Returns outputs [T, hiddenSize] and final state.
 // Initial h and c are zero if state is nil.
+//
+// Implemented as a single autograd op over the whole sequence so gradients
+// flow correctly through every gate at every timestep (full BPTT).
 func (l *LSTM) Forward(x *autograd.Variable, state *LSTMState) ([]*autograd.Variable, *LSTMState) {
 	T := x.Data.Shape()[0]
 	H := l.HiddenSize
 
-	var h, c *autograd.Variable
+	var h0, c0 *autograd.Variable
 	if state != nil {
-		h, c = state.H, state.C
+		h0, c0 = state.H, state.C
 	} else {
-		h = autograd.NewVar(tensor.Zeros(H), false)
-		c = autograd.NewVar(tensor.Zeros(H), false)
+		h0 = autograd.NewVar(tensor.Zeros(H), false)
+		c0 = autograd.NewVar(tensor.Zeros(H), false)
 	}
 
+	stackedH, finalC, _ := lstmSequenceForward(x, h0, c0, l.WX, l.WH, l.B)
+
+	// Expose per-timestep outputs as autograd-aware row slices of stackedH.
 	outputs := make([]*autograd.Variable, T)
-	bData := l.B.Data.Data()
+	for t := 0; t < T; t++ {
+		outputs[t] = rowSlice(stackedH, t)
+	}
+
+	return outputs, &LSTMState{H: outputs[T-1], C: finalC}
+}
+
+// lstmSequenceForward runs the LSTM cell over the full sequence and registers
+// a single autograd op that implements BPTT in its backward pass.
+//
+// Returns:
+//   stackedH [T, H]       — differentiable
+//   finalC   [H]          — non-differentiable convenience handle
+//   intermediates         — used by tests
+func lstmSequenceForward(x, h0, c0, WX, WH, B *autograd.Variable) (
+	*autograd.Variable, *autograd.Variable, *lstmIntermediates,
+) {
+	T := x.Data.Shape()[0]
+	I := x.Data.Shape()[1]
+	H := h0.Data.Size()
+
+	xData := x.Data.Data()
+	wxData := WX.Data.Data()
+	whData := WH.Data.Data()
+	bData := B.Data.Data()
+
+	im := &lstmIntermediates{
+		T: T, I: I, H: H,
+		xt:     make([][]float64, T),
+		hPrev:  make([][]float64, T),
+		cPrev:  make([][]float64, T),
+		i:      make([][]float64, T),
+		f:      make([][]float64, T),
+		g:      make([][]float64, T),
+		o:      make([][]float64, T),
+		tanhC:  make([][]float64, T),
+	}
+
+	hPrev := append([]float64(nil), h0.Data.Data()...)
+	cPrev := append([]float64(nil), c0.Data.Data()...)
+
+	stackedHData := make([]float64, T*H)
 
 	for t := 0; t < T; t++ {
-		// Get x_t: [1, inputSize] → [inputSize]
-		xt := autograd.NewVar(x.Data.Select(0, t), false)
+		xt := xData[t*I : (t+1)*I]
+		im.xt[t] = append([]float64(nil), xt...)
+		im.hPrev[t] = append([]float64(nil), hPrev...)
+		im.cPrev[t] = append([]float64(nil), cPrev...)
 
-		// gates = x_t @ WX + h @ WH + b → [4*H]
-		xGates := matVec(xt.Data, l.WX.Data)  // [4H]
-		hGates := matVec(h.Data, l.WH.Data)   // [4H]
-
-		gateData := make([]float64, 4*H)
-		for j := 0; j < 4*H; j++ {
-			gateData[j] = xGates[j] + hGates[j] + bData[j]
+		// linGates = xt @ WX + hPrev @ WH + b  -> [4H]
+		linGates := make([]float64, 4*H)
+		for m := 0; m < 4*H; m++ {
+			s := bData[m]
+			for n := 0; n < I; n++ {
+				s += xt[n] * wxData[n*4*H+m]
+			}
+			for n := 0; n < H; n++ {
+				s += hPrev[n] * whData[n*4*H+m]
+			}
+			linGates[m] = s
 		}
 
-		// Slice gates (i, f, g, o order — matching PyTorch)
-		iG := sigmoid1D(gateData[0*H : 1*H])
-		fG := sigmoid1D(gateData[1*H : 2*H])
-		gG := tanh1D(gateData[2*H : 3*H])
-		oG := sigmoid1D(gateData[3*H : 4*H])
-
-		// c_t = f * c_{t-1} + i * g
-		cData := c.Data.Data()
-		newCData := make([]float64, H)
+		iG := make([]float64, H)
+		fG := make([]float64, H)
+		gG := make([]float64, H)
+		oG := make([]float64, H)
 		for j := 0; j < H; j++ {
-			newCData[j] = fG[j]*cData[j] + iG[j]*gG[j]
+			iG[j] = sigmoidScalar(linGates[0*H+j])
+			fG[j] = sigmoidScalar(linGates[1*H+j])
+			gG[j] = math.Tanh(linGates[2*H+j])
+			oG[j] = sigmoidScalar(linGates[3*H+j])
 		}
-		c = autograd.NewVar(tensor.New(newCData, []int{H}), false)
+		im.i[t] = iG
+		im.f[t] = fG
+		im.g[t] = gG
+		im.o[t] = oG
 
-		// h_t = o * tanh(c_t)
-		newHData := make([]float64, H)
-		tanhC := tanh1D(newCData)
+		cNew := make([]float64, H)
+		hNew := make([]float64, H)
+		tanhC := make([]float64, H)
 		for j := 0; j < H; j++ {
-			newHData[j] = oG[j] * tanhC[j]
+			cNew[j] = fG[j]*cPrev[j] + iG[j]*gG[j]
+			tanhC[j] = math.Tanh(cNew[j])
+			hNew[j] = oG[j] * tanhC[j]
 		}
-		h = autograd.NewVar(tensor.New(newHData, []int{H}), true)
-		outputs[t] = h
+		im.tanhC[t] = tanhC
+
+		copy(stackedHData[t*H:(t+1)*H], hNew)
+		cPrev = cNew
+		hPrev = hNew
 	}
 
-	return outputs, &LSTMState{H: h, C: c}
+	stackedH := autograd.NewResult(
+		tensor.New(stackedHData, []int{T, H}),
+		&lstmSequenceBackward{im: im, wxData: wxData, whData: whData},
+		x, h0, c0, WX, WH, B,
+	)
+	finalC := autograd.NewVar(tensor.New(cPrev, []int{H}), false)
+	return stackedH, finalC, im
+}
+
+type lstmIntermediates struct {
+	T, I, H int
+	xt      [][]float64
+	hPrev   [][]float64
+	cPrev   [][]float64
+	i, f, g [][]float64
+	o       [][]float64
+	tanhC   [][]float64
+}
+
+type lstmSequenceBackward struct {
+	im     *lstmIntermediates
+	wxData []float64 // [I, 4H]
+	whData []float64 // [H, 4H]
+}
+
+// Apply implements BPTT for an entire LSTM sequence.
+// Inputs in order: x [T,I], h0 [H], c0 [H], WX [I,4H], WH [H,4H], B [4H].
+// grad is upstream gradient on stackedH [T, H].
+func (b *lstmSequenceBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	im := b.im
+	T, I, H := im.T, im.I, im.H
+	gradFlat := grad.Data()
+	wxRef := b.wxData
+	whRef := b.whData
+
+	dX := make([]float64, T*I)
+	dWX := make([]float64, I*4*H)
+	dWH := make([]float64, H*4*H)
+	dB := make([]float64, 4*H)
+	dhNext := make([]float64, H)
+	dcNext := make([]float64, H)
+
+	for t := T - 1; t >= 0; t-- {
+		i := im.i[t]
+		f := im.f[t]
+		g := im.g[t]
+		o := im.o[t]
+		tc := im.tanhC[t]
+		cPrev := im.cPrev[t]
+		hPrev := im.hPrev[t]
+		xt := im.xt[t]
+
+		// Upstream gradient on h_t: from stacked output + from next step's h_{t-1} = h_t
+		dh := make([]float64, H)
+		for j := 0; j < H; j++ {
+			dh[j] = gradFlat[t*H+j] + dhNext[j]
+		}
+		// dc_t: only from next step (c_t isn't an output of stackedH)
+		dc := make([]float64, H)
+		copy(dc, dcNext)
+
+		// h_t = o * tanh(c_t)  →  do = dh * tanh_c,  d_tanh_c = dh * o
+		// c_t flow: dc += d_tanh_c * (1 - tanh_c^2)
+		dLinGates := make([]float64, 4*H)
+		for j := 0; j < H; j++ {
+			doVal := dh[j] * tc[j]
+			dTanhC := dh[j] * o[j]
+			dc[j] += dTanhC * (1 - tc[j]*tc[j])
+
+			// c_t = f*cPrev + i*g
+			df := dc[j] * cPrev[j]
+			di := dc[j] * g[j]
+			dg := dc[j] * i[j]
+			dcPrev := dc[j] * f[j]
+
+			// sigmoid'(x) = s*(1-s); tanh'(x) = 1 - t^2
+			dLinGates[0*H+j] = di * i[j] * (1 - i[j])
+			dLinGates[1*H+j] = df * f[j] * (1 - f[j])
+			dLinGates[2*H+j] = dg * (1 - g[j]*g[j])
+			dLinGates[3*H+j] = doVal * o[j] * (1 - o[j])
+
+			dcNext[j] = dcPrev
+		}
+
+		// db += dLinGates
+		for m := 0; m < 4*H; m++ {
+			dB[m] += dLinGates[m]
+		}
+
+		// dxt = dLinGates @ WX^T;  dWX += xt^T @ dLinGates (outer product)
+		for n := 0; n < I; n++ {
+			s := 0.0
+			for m := 0; m < 4*H; m++ {
+				s += dLinGates[m] * wxRef[n*4*H+m]
+			}
+			dX[t*I+n] = s
+		}
+		for n := 0; n < I; n++ {
+			for m := 0; m < 4*H; m++ {
+				dWX[n*4*H+m] += xt[n] * dLinGates[m]
+			}
+		}
+
+		// dh_{t-1} = dLinGates @ WH^T;  dWH += hPrev^T @ dLinGates
+		for n := 0; n < H; n++ {
+			s := 0.0
+			for m := 0; m < 4*H; m++ {
+				s += dLinGates[m] * whRef[n*4*H+m]
+			}
+			dhNext[n] = s
+		}
+		for n := 0; n < H; n++ {
+			for m := 0; m < 4*H; m++ {
+				dWH[n*4*H+m] += hPrev[n] * dLinGates[m]
+			}
+		}
+	}
+
+	dh0 := dhNext
+	dc0 := dcNext
+
+	return []*tensor.Tensor{
+		tensor.New(dX, []int{T, I}),
+		tensor.New(dh0, []int{H}),
+		tensor.New(dc0, []int{H}),
+		tensor.New(dWX, []int{I, 4 * H}),
+		tensor.New(dWH, []int{H, 4 * H}),
+		tensor.New(dB, []int{4 * H}),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -173,55 +360,215 @@ func (g *GRU) ZeroGrad() {
 }
 
 // Forward runs GRU over x [T, inputSize]. h0 is zero if nil.
+//
+// Implemented as a single autograd op with full BPTT through reset/update gates.
 func (g *GRU) Forward(x *autograd.Variable, h0 *autograd.Variable) []*autograd.Variable {
 	T := x.Data.Shape()[0]
 	H := g.HiddenSize
 
-	var h *autograd.Variable
-	if h0 != nil {
-		h = h0
-	} else {
-		h = autograd.NewVar(tensor.Zeros(H), false)
+	if h0 == nil {
+		h0 = autograd.NewVar(tensor.Zeros(H), false)
 	}
 
-	bData := g.B.Data.Data()
+	stacked := gruSequenceForward(x, h0, g.WX, g.WH, g.B)
 	outputs := make([]*autograd.Variable, T)
-
 	for t := 0; t < T; t++ {
-		xt := x.Data.Select(0, t)
-		xGates := matVec(xt, g.WX.Data) // [3H]
-		hGates := matVec(h.Data, g.WH.Data) // [3H]
-
-		zData := make([]float64, H)
-		rData := make([]float64, H)
-		nInputData := make([]float64, H)
-
-		for j := 0; j < H; j++ {
-			zData[j] = xGates[j] + hGates[j] + bData[j]
-			rData[j] = xGates[H+j] + hGates[H+j] + bData[H+j]
-			nInputData[j] = xGates[2*H+j] + bData[2*H+j]
-		}
-
-		zG := sigmoid1D(zData)
-		rG := sigmoid1D(rData)
-
-		// n_t = tanh(xn + r * (hGates for n gate))
-		nData := make([]float64, H)
-		for j := 0; j < H; j++ {
-			nData[j] = nInputData[j] + rG[j]*hGates[2*H+j]
-		}
-		nG := tanh1D(nData)
-
-		// h_t = (1-z)*h + z*n
-		hData := h.Data.Data()
-		newH := make([]float64, H)
-		for j := 0; j < H; j++ {
-			newH[j] = (1-zG[j])*hData[j] + zG[j]*nG[j]
-		}
-		h = autograd.NewVar(tensor.New(newH, []int{H}), true)
-		outputs[t] = h
+		outputs[t] = rowSlice(stacked, t)
 	}
 	return outputs
+}
+
+func gruSequenceForward(x, h0, WX, WH, B *autograd.Variable) *autograd.Variable {
+	T := x.Data.Shape()[0]
+	I := x.Data.Shape()[1]
+	H := h0.Data.Size()
+
+	xData := x.Data.Data()
+	wxData := WX.Data.Data()
+	whData := WH.Data.Data()
+	bData := B.Data.Data()
+
+	im := &gruIntermediates{
+		T: T, I: I, H: H,
+		xt:     make([][]float64, T),
+		hPrev:  make([][]float64, T),
+		z:      make([][]float64, T),
+		r:      make([][]float64, T),
+		n:      make([][]float64, T),
+		hnInput: make([][]float64, T), // hPrev @ WH for n-slice (hGates_n) — needed for dr
+	}
+
+	hPrev := append([]float64(nil), h0.Data.Data()...)
+	stackedData := make([]float64, T*H)
+
+	for t := 0; t < T; t++ {
+		xt := xData[t*I : (t+1)*I]
+		im.xt[t] = append([]float64(nil), xt...)
+		im.hPrev[t] = append([]float64(nil), hPrev...)
+
+		// xGates [3H], hGates [3H]
+		xGates := make([]float64, 3*H)
+		hGates := make([]float64, 3*H)
+		for m := 0; m < 3*H; m++ {
+			sx := 0.0
+			for n := 0; n < I; n++ {
+				sx += xt[n] * wxData[n*3*H+m]
+			}
+			sh := 0.0
+			for n := 0; n < H; n++ {
+				sh += hPrev[n] * whData[n*3*H+m]
+			}
+			xGates[m] = sx
+			hGates[m] = sh
+		}
+		im.hnInput[t] = append([]float64(nil), hGates[2*H:3*H]...)
+
+		z := make([]float64, H)
+		r := make([]float64, H)
+		nVal := make([]float64, H)
+		hNew := make([]float64, H)
+		for j := 0; j < H; j++ {
+			z[j] = sigmoidScalar(xGates[j] + hGates[j] + bData[j])
+			r[j] = sigmoidScalar(xGates[H+j] + hGates[H+j] + bData[H+j])
+			nInput := xGates[2*H+j] + bData[2*H+j] + r[j]*hGates[2*H+j]
+			nVal[j] = math.Tanh(nInput)
+			hNew[j] = (1-z[j])*hPrev[j] + z[j]*nVal[j]
+		}
+		im.z[t] = z
+		im.r[t] = r
+		im.n[t] = nVal
+
+		copy(stackedData[t*H:(t+1)*H], hNew)
+		hPrev = hNew
+	}
+
+	return autograd.NewResult(
+		tensor.New(stackedData, []int{T, H}),
+		&gruSequenceBackward{im: im, wxData: wxData, whData: whData},
+		x, h0, WX, WH, B,
+	)
+}
+
+type gruIntermediates struct {
+	T, I, H int
+	xt      [][]float64
+	hPrev   [][]float64
+	z, r, n [][]float64
+	hnInput [][]float64 // hGates[2H:3H] per t (needed for dr backward)
+}
+
+type gruSequenceBackward struct {
+	im     *gruIntermediates
+	wxData []float64
+	whData []float64
+}
+
+func (b *gruSequenceBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	im := b.im
+	T, I, H := im.T, im.I, im.H
+	gradFlat := grad.Data()
+
+	dX := make([]float64, T*I)
+	dWX := make([]float64, I*3*H)
+	dWH := make([]float64, H*3*H)
+	dB := make([]float64, 3*H)
+	dhNext := make([]float64, H)
+
+	for t := T - 1; t >= 0; t-- {
+		z := im.z[t]
+		r := im.r[t]
+		nVal := im.n[t]
+		hPrev := im.hPrev[t]
+		xt := im.xt[t]
+		hnIn := im.hnInput[t]
+
+		dh := make([]float64, H)
+		for j := 0; j < H; j++ {
+			dh[j] = gradFlat[t*H+j] + dhNext[j]
+		}
+
+		// h_t = (1-z)*hPrev + z*n
+		// dz = dh * (n - hPrev)
+		// dn = dh * z
+		// dhPrev_direct = dh * (1 - z)
+		dLin := make([]float64, 3*H) // pre-activation gradients [dz_lin, dr_lin, dn_lin]
+		dhPrevAcc := make([]float64, H)
+
+		for j := 0; j < H; j++ {
+			dz := dh[j] * (nVal[j] - hPrev[j])
+			dn := dh[j] * z[j]
+			dhPrevAcc[j] += dh[j] * (1 - z[j])
+
+			// n = tanh(xn + b_n + r * hnIn)
+			dnLin := dn * (1 - nVal[j]*nVal[j])
+			dr := dnLin * hnIn[j]
+			dHnIn := dnLin * r[j] // gradient into hGates[2H+j]
+
+			dLin[0*H+j] = dz * z[j] * (1 - z[j]) // dz_lin
+			dLin[1*H+j] = dr * r[j] * (1 - r[j]) // dr_lin
+			dLin[2*H+j] = dnLin                  // dn pre-activation w.r.t. (xn + b_n)
+
+			// dWH[:,2H+j] is split: hnIn contributes via dHnIn to hGates_n,
+			// which equals hPrev @ WH_n. Apply this through WH below using a
+			// separate path — accumulate dHnIn into a per-j buffer.
+			// We handle it via dLinH (linear pre-activation for WH path).
+			_ = dHnIn // see dLinH below
+		}
+
+		// For WH path, the "linear pre-activation" gradient is different for n gate
+		// because hGates_n is multiplied by r before going into tanh:
+		//   dHGates_n = dn_lin * r
+		dLinH := make([]float64, 3*H)
+		for j := 0; j < H; j++ {
+			dLinH[0*H+j] = dLin[0*H+j]
+			dLinH[1*H+j] = dLin[1*H+j]
+			dLinH[2*H+j] = dLin[2*H+j] * r[j] // gated by r for WH side
+		}
+
+		// Bias: dB has same structure as xGates linear, since for n gate b_n
+		// directly contributes to (xn + b_n + r*hn) — bias is NOT gated by r.
+		for m := 0; m < 3*H; m++ {
+			dB[m] += dLin[m]
+		}
+
+		// dWX, dxt — use dLin (x-side has no r-gating)
+		for n := 0; n < I; n++ {
+			s := 0.0
+			for m := 0; m < 3*H; m++ {
+				s += dLin[m] * b.wxData[n*3*H+m]
+			}
+			dX[t*I+n] = s
+		}
+		for n := 0; n < I; n++ {
+			for m := 0; m < 3*H; m++ {
+				dWX[n*3*H+m] += xt[n] * dLin[m]
+			}
+		}
+
+		// dWH, dhPrev — use dLinH (n-gate gated by r)
+		for n := 0; n < H; n++ {
+			s := 0.0
+			for m := 0; m < 3*H; m++ {
+				s += dLinH[m] * b.whData[n*3*H+m]
+			}
+			dhPrevAcc[n] += s
+		}
+		for n := 0; n < H; n++ {
+			for m := 0; m < 3*H; m++ {
+				dWH[n*3*H+m] += hPrev[n] * dLinH[m]
+			}
+		}
+
+		dhNext = dhPrevAcc
+	}
+
+	return []*tensor.Tensor{
+		tensor.New(dX, []int{T, I}),
+		tensor.New(dhNext, []int{H}),
+		tensor.New(dWX, []int{I, 3 * H}),
+		tensor.New(dWH, []int{H, 3 * H}),
+		tensor.New(dB, []int{3 * H}),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -322,37 +669,35 @@ func residualAdd(a, b *autograd.Variable) *autograd.Variable {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// matVec computes x (1D [N]) @ W ([N, M]) → 1D [M]
-func matVec(x, W *tensor.Tensor) []float64 {
-	N := W.Shape()[0]
-	M := W.Shape()[1]
-	xData := x.Data()
-	wData := W.Data()
-	out := make([]float64, M)
-	for m := 0; m < M; m++ {
-		s := 0.0
-		for n := 0; n < N; n++ {
-			s += xData[n] * wData[n*M+m]
-		}
-		out[m] = s
-	}
-	return out
+
+func sigmoidScalar(x float64) float64 {
+	return 1.0 / (1.0 + math.Exp(-x))
 }
 
-func sigmoid1D(x []float64) []float64 {
-	out := make([]float64, len(x))
-	for i, v := range x {
-		out[i] = 1.0 / (1.0 + math.Exp(-v))
-	}
-	return out
+// rowSlice extracts row t from a 2D Variable [T, H] as a 1D Variable [H],
+// with proper autograd support: gradient on the slice flows back into the
+// corresponding row of the source tensor.
+type rowSliceBackward struct {
+	t, T, H int
 }
 
-func tanh1D(x []float64) []float64 {
-	out := make([]float64, len(x))
-	for i, v := range x {
-		out[i] = math.Tanh(v)
-	}
-	return out
+func (f *rowSliceBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	out := make([]float64, f.T*f.H)
+	g := grad.Data()
+	copy(out[f.t*f.H:(f.t+1)*f.H], g)
+	return []*tensor.Tensor{tensor.New(out, []int{f.T, f.H})}
+}
+
+func rowSlice(x *autograd.Variable, t int) *autograd.Variable {
+	T := x.Data.Shape()[0]
+	H := x.Data.Shape()[1]
+	row := make([]float64, H)
+	copy(row, x.Data.Data()[t*H:(t+1)*H])
+	return autograd.NewResult(
+		tensor.New(row, []int{H}),
+		&rowSliceBackward{t: t, T: T, H: H},
+		x,
+	)
 }
 
 // ---------------------------------------------------------------------------

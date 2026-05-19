@@ -184,8 +184,8 @@ func Log(a *Variable) *Variable {
 type sumAllBackward struct{ shape []int }
 
 func (f *sumAllBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
-	// broadcast scalar grad to input shape
-	return []*tensor.Tensor{tensor.Ones(f.shape...)}
+	// d(sum)/dx_i = 1, so dx = grad_out * ones(shape)
+	return []*tensor.Tensor{tensor.MulScalar(tensor.Ones(f.shape...), grad.Item())}
 }
 
 func Sum(a *Variable) *Variable {
@@ -220,7 +220,8 @@ type meanAllBackward struct {
 }
 
 func (f *meanAllBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
-	return []*tensor.Tensor{tensor.MulScalar(tensor.Ones(f.shape...), 1.0/f.n)}
+	// d(mean)/dx_i = 1/n, so dx = grad_out * (1/n) * ones(shape)
+	return []*tensor.Tensor{tensor.MulScalar(tensor.Ones(f.shape...), grad.Item()/f.n)}
 }
 
 func Mean(a *Variable) *Variable {
@@ -306,13 +307,25 @@ func Tanh(a *Variable) *Variable {
 	return newResult(out, &tanhBackward{out}, a)
 }
 
-// ---- Softmax (for use in loss, not recommended to differentiate directly) ----
+// ---- Softmax ----
+
+type softmaxBackward struct {
+	out *tensor.Tensor
+	dim int
+}
+
+func (f *softmaxBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	// Jacobian: dx_i = s_i * (g_i - sum_j(g_j * s_j))
+	// vector form along dim: dx = s * (g - sum(g*s, dim, keepdim=true))
+	gs := tensor.Mul(grad, f.out)
+	sumGS := tensor.Sum(gs, f.dim, true) // keepdim for broadcasting
+	dx := tensor.Mul(f.out, tensor.Sub(grad, sumGS))
+	return []*tensor.Tensor{dx}
+}
 
 func Softmax(a *Variable, dim int) *Variable {
 	out := tensor.Softmax(a.Data, dim)
-	// Gradient through softmax is complex; for CrossEntropyLoss use LogSoftmax+NLLLoss
-	// Here we provide an approximate gradient (identity) — use inside loss only
-	return newResult(out, &identityBackward{}, a)
+	return newResult(out, &softmaxBackward{out: out, dim: dim}, a)
 }
 
 type identityBackward struct{}

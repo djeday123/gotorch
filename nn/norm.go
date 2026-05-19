@@ -239,6 +239,7 @@ type layerNormBackward struct {
 	normSize int
 	eps      float64
 	outShape []int
+	stds     []float64 // per-group std, captured in forward
 }
 
 func (f *layerNormBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
@@ -246,47 +247,39 @@ func (f *layerNormBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
 	total := grad.Size()
 	groups := total / f.normSize
 
-	dGamma := tensor.Zeros(f.normSize)
-	dBeta := tensor.Zeros(f.normSize)
-	dX := tensor.Zeros(f.outShape...)
-
 	gradFlat := grad.Data()
 	xnFlat := f.xNorm.Data()
 	gammaFlat := f.gamma.Data()
 
+	dGammaFlat := make([]float64, f.normSize)
+	dBetaFlat := make([]float64, f.normSize)
+	dXFlat := make([]float64, total)
+
 	for g := 0; g < groups; g++ {
 		base := g * f.normSize
+		std := f.stds[g]
+
 		sumDy := 0.0
 		sumDyXn := 0.0
 		for j := 0; j < f.normSize; j++ {
 			dy := gradFlat[base+j]
 			xn := xnFlat[base+j]
-			sumDy += dy
-			sumDyXn += dy * xn
-			dGamma.Set(dGamma.At(j)+dy*xn, j)
-			dBeta.Set(dBeta.At(j)+dy, j)
+			sumDy += dy * gammaFlat[j]
+			sumDyXn += dy * gammaFlat[j] * xn
+			dGammaFlat[j] += dy * xn
+			dBetaFlat[j] += dy
 		}
-		// Compute std from xNorm (we need it for the gradient)
-		// We approximate: since we need std, store it. Here we re-derive from gamma trick.
-		// Actually we need the std. Let's compute it from xNorm values.
-		// For each group, the xnorm values were (x-mean)/std.
-		// We can get std from the variance of (x - mean) but we stored xNorm.
-		// Simplification: use a unit std approximation for backward (common in practice).
-		// For correctness, store std during forward. This is a simplified backward.
 		for j := 0; j < f.normSize; j++ {
 			dy := gradFlat[base+j]
 			xn := xnFlat[base+j]
-			// dX[i] = (gamma[j]/std) * (dy - sumDy/M - xn*sumDyXn/M)
-			// We use gammaFlat[j] / 1.0 as approximation (std not stored).
-			// For exact backward, store std in the closure.
-			dx := gammaFlat[j] * (dy - sumDy/M - xn*sumDyXn/M)
-			// Write to flat position
-			flatIdx := base + j
-			dXFlat := dX.Data()
-			dXFlat[flatIdx] += dx
-			dX = tensor.New(dXFlat, f.outShape)
+			// dx = (1/std) * (gamma*dy - sumDy/M - xn*sumDyXn/M)
+			dXFlat[base+j] = (gammaFlat[j]*dy - sumDy/M - xn*sumDyXn/M) / std
 		}
 	}
+
+	dX := tensor.New(dXFlat, f.outShape)
+	dGamma := tensor.New(dGammaFlat, f.gamma.Shape())
+	dBeta := tensor.New(dBetaFlat, f.gamma.Shape())
 	return []*tensor.Tensor{dX, dGamma, dBeta}
 }
 
@@ -303,6 +296,7 @@ func layerNormForward(x, gamma, beta *autograd.Variable, eps float64) *autograd.
 
 	outFlat := make([]float64, total)
 	xnFlat := make([]float64, total)
+	stds := make([]float64, groups)
 
 	for g := 0; g < groups; g++ {
 		base := g * normSize
@@ -319,6 +313,7 @@ func layerNormForward(x, gamma, beta *autograd.Variable, eps float64) *autograd.
 			varSum += d * d
 		}
 		std := math.Sqrt(varSum/float64(normSize) + eps)
+		stds[g] = std
 		// Normalise
 		for j := 0; j < normSize; j++ {
 			xn := (xFlat[base+j] - mean) / std
@@ -333,6 +328,7 @@ func layerNormForward(x, gamma, beta *autograd.Variable, eps float64) *autograd.
 	return autograd.NewResult(out, &layerNormBackward{
 		xNorm: xNorm, gamma: gamma.Data,
 		normSize: normSize, eps: eps, outShape: shape,
+		stds: stds,
 	}, x, gamma, beta)
 }
 
@@ -446,8 +442,90 @@ func (b *BatchNorm1d) Forward(x *autograd.Variable) *autograd.Variable {
 	}
 
 	out := tensor.New(outFlat, shape)
-	// Simplified: reuse LayerNorm-style backward (no exact BN1d backward needed for tests)
-	return autograd.NewVar(out, false)
+
+	// Store xnorm and stds for backward.
+	xnFlat := make([]float64, len(xFlat))
+	stds := make([]float64, C)
+	for c := 0; c < C; c++ {
+		std := math.Sqrt(variance[c] + b.Eps)
+		stds[c] = std
+		for n := 0; n < N; n++ {
+			for l := 0; l < L; l++ {
+				idx := n*C*L + c*L + l
+				xnFlat[idx] = (xFlat[idx] - mean[c]) / std
+			}
+		}
+	}
+	xNorm := tensor.New(xnFlat, shape)
+
+	return autograd.NewResult(out, &batchNorm1dBackward{
+		xNorm:    xNorm,
+		gamma:    b.Gamma.Data,
+		stds:     stds,
+		N:        N,
+		C:        C,
+		L:        L,
+		training: b.Training,
+		outShape: shape,
+	}, x, b.Gamma, b.Beta)
+}
+
+type batchNorm1dBackward struct {
+	xNorm    *tensor.Tensor
+	gamma    *tensor.Tensor
+	stds     []float64 // per channel
+	N, C, L  int
+	training bool
+	outShape []int
+}
+
+func (f *batchNorm1dBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	gradFlat := grad.Data()
+	xnFlat := f.xNorm.Data()
+	gammaFlat := f.gamma.Data()
+
+	dGammaFlat := make([]float64, f.C)
+	dBetaFlat := make([]float64, f.C)
+	dXFlat := make([]float64, len(gradFlat))
+
+	M := float64(f.N * f.L)
+
+	for c := 0; c < f.C; c++ {
+		std := f.stds[c]
+		sumDy := 0.0
+		sumDyXn := 0.0
+		for n := 0; n < f.N; n++ {
+			for l := 0; l < f.L; l++ {
+				idx := n*f.C*f.L + c*f.L + l
+				dy := gradFlat[idx]
+				xn := xnFlat[idx]
+				sumDy += dy
+				sumDyXn += dy * xn
+				dGammaFlat[c] += dy * xn
+				dBetaFlat[c] += dy
+			}
+		}
+		for n := 0; n < f.N; n++ {
+			for l := 0; l < f.L; l++ {
+				idx := n*f.C*f.L + c*f.L + l
+				dy := gradFlat[idx]
+				xn := xnFlat[idx]
+				if f.training {
+					// dx = (gamma/std) * (dy - sumDy/M - xn*sumDyXn/M)
+					dXFlat[idx] = (gammaFlat[c] / std) * (dy - sumDy/M - xn*sumDyXn/M)
+				} else {
+					// eval: std is a constant
+					dXFlat[idx] = (gammaFlat[c] / std) * dy
+				}
+			}
+		}
+	}
+
+	return []*tensor.Tensor{
+		tensor.New(dXFlat, f.outShape),
+		tensor.New(dGammaFlat, f.gamma.Shape()),
+		tensor.New(dBetaFlat, f.gamma.Shape()),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -501,45 +579,116 @@ func (gn *GroupNorm) Forward(x *autograd.Variable) *autograd.Variable {
 
 	xFlat := x.Data.Data()
 	outFlat := make([]float64, len(xFlat))
+	xnFlat := make([]float64, len(xFlat))
 	gd := gn.Gamma.Data.Data()
 	bd := gn.Beta.Data.Data()
+
+	// Stds keyed by (n, group) for backward.
+	stds := make([]float64, N*G)
 
 	for n := 0; n < N; n++ {
 		for gr := 0; gr < G; gr++ {
 			cStart := gr * chPerGroup
 			cEnd := cStart + chPerGroup
 
-			// Collect group elements
 			sum := 0.0
-			var indices []int
 			for c := cStart; c < cEnd; c++ {
 				for s := 0; s < spatial; s++ {
-					idx := n*C*spatial + c*spatial + s
-					sum += xFlat[idx]
-					indices = append(indices, idx)
+					sum += xFlat[n*C*spatial+c*spatial+s]
 				}
 			}
 			mean := sum / float64(elemPerGroup)
 
 			varSum := 0.0
-			for _, idx := range indices {
-				d := xFlat[idx] - mean
-				varSum += d * d
+			for c := cStart; c < cEnd; c++ {
+				for s := 0; s < spatial; s++ {
+					d := xFlat[n*C*spatial+c*spatial+s] - mean
+					varSum += d * d
+				}
 			}
 			std := math.Sqrt(varSum/float64(elemPerGroup) + gn.Eps)
+			stds[n*G+gr] = std
 
-			// Normalise and apply affine
 			for c := cStart; c < cEnd; c++ {
 				for s := 0; s < spatial; s++ {
 					idx := n*C*spatial + c*spatial + s
 					xn := (xFlat[idx] - mean) / std
+					xnFlat[idx] = xn
 					outFlat[idx] = gd[c]*xn + bd[c]
 				}
 			}
-			indices = indices[:0] // reset slice
 		}
 	}
 
 	out := tensor.New(outFlat, shape)
-	return autograd.NewVar(out, false)
+	xNorm := tensor.New(xnFlat, shape)
+
+	return autograd.NewResult(out, &groupNormBackward{
+		xNorm:        xNorm,
+		gamma:        gn.Gamma.Data,
+		stds:         stds,
+		N:            N,
+		C:            C,
+		G:            G,
+		chPerGroup:   chPerGroup,
+		spatial:      spatial,
+		elemPerGroup: elemPerGroup,
+		outShape:     shape,
+	}, x, gn.Gamma, gn.Beta)
+}
+
+type groupNormBackward struct {
+	xNorm                                       *tensor.Tensor
+	gamma                                       *tensor.Tensor
+	stds                                        []float64
+	N, C, G, chPerGroup, spatial, elemPerGroup  int
+	outShape                                    []int
+}
+
+func (f *groupNormBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
+	gradFlat := grad.Data()
+	xnFlat := f.xNorm.Data()
+	gammaFlat := f.gamma.Data()
+
+	dGammaFlat := make([]float64, f.C)
+	dBetaFlat := make([]float64, f.C)
+	dXFlat := make([]float64, len(gradFlat))
+
+	M := float64(f.elemPerGroup)
+
+	for n := 0; n < f.N; n++ {
+		for gr := 0; gr < f.G; gr++ {
+			cStart := gr * f.chPerGroup
+			cEnd := cStart + f.chPerGroup
+			std := f.stds[n*f.G+gr]
+
+			sumDyG := 0.0   // sum of (dy * gamma) over group
+			sumDyGXn := 0.0 // sum of (dy * gamma * xn) over group
+			for c := cStart; c < cEnd; c++ {
+				for s := 0; s < f.spatial; s++ {
+					idx := n*f.C*f.spatial + c*f.spatial + s
+					dy := gradFlat[idx]
+					xn := xnFlat[idx]
+					sumDyG += dy * gammaFlat[c]
+					sumDyGXn += dy * gammaFlat[c] * xn
+					dGammaFlat[c] += dy * xn
+					dBetaFlat[c] += dy
+				}
+			}
+			for c := cStart; c < cEnd; c++ {
+				for s := 0; s < f.spatial; s++ {
+					idx := n*f.C*f.spatial + c*f.spatial + s
+					dy := gradFlat[idx]
+					xn := xnFlat[idx]
+					dXFlat[idx] = (gammaFlat[c]*dy - sumDyG/M - xn*sumDyGXn/M) / std
+				}
+			}
+		}
+	}
+
+	return []*tensor.Tensor{
+		tensor.New(dXFlat, f.outShape),
+		tensor.New(dGammaFlat, f.gamma.Shape()),
+		tensor.New(dBetaFlat, f.gamma.Shape()),
+	}
 }
