@@ -2,6 +2,7 @@ package data
 
 import (
 	"math/rand"
+	"sync"
 
 	"github.com/djeday123/gotorch/tensor"
 )
@@ -14,6 +15,14 @@ type Batch struct {
 
 // DataLoader iterates over a Dataset in mini-batches.
 // Call Reset() before each epoch, then loop HasNext() / Next().
+//
+// Concurrency:
+//   - All public methods are safe to call from a single consumer goroutine.
+//   - Internally, a prefetch worker may run concurrently; it produces batches
+//     by index (not by shared cursor), so no shared mutable iteration state
+//     is touched.
+//   - Reset()/HasNext()/Next() are serialised via `mu` so that calling Reset()
+//     while a consumer is between HasNext() and Next() is well-defined.
 type DataLoader struct {
 	dataset   Dataset
 	batchSize int
@@ -21,11 +30,11 @@ type DataLoader struct {
 	dropLast  bool
 	prefetch  int // number of batches to prefetch
 
+	mu           sync.Mutex
 	indices      []int
-	cursor       int   // position in indices (used only in sync path or by worker)
-	totalBatches int   // set in Reset()
-	consumed     int   // batches consumed so far (main goroutine)
-	ch           chan Batch
+	totalBatches int        // set in Reset()
+	consumed     int        // batches consumed so far
+	ch           chan Batch // buffer of pre-loaded batches (prefetch>0)
 	done         chan struct{}
 }
 
@@ -64,12 +73,18 @@ func NewDataLoader(dataset Dataset, batchSize int, opts ...DataLoaderOption) *Da
 // Reset resets to the start of a new epoch (reshuffles if needed).
 // Must be called before the first use and between epochs.
 func (dl *DataLoader) Reset() {
-	// Stop any running prefetch goroutine
+	dl.mu.Lock()
+	// Stop any running prefetch goroutine before we mutate iteration state.
 	if dl.done != nil {
 		close(dl.done)
-		for range dl.ch { // drain
-		}
+		oldCh := dl.ch
 		dl.done = nil
+		dl.ch = nil
+		dl.mu.Unlock()
+		// Drain remaining items so the worker can exit on its send path.
+		for range oldCh {
+		}
+		dl.mu.Lock()
 	}
 
 	n := dl.dataset.Len()
@@ -82,33 +97,61 @@ func (dl *DataLoader) Reset() {
 			dl.indices[i], dl.indices[j] = dl.indices[j], dl.indices[i]
 		})
 	}
-	dl.cursor = 0
 	dl.consumed = 0
-	dl.totalBatches = dl.NumBatches()
+	dl.totalBatches = dl.numBatchesLocked()
 
 	if dl.prefetch > 0 {
 		dl.ch = make(chan Batch, dl.prefetch)
 		dl.done = make(chan struct{})
-		go dl.prefetchWorker()
+		ch := dl.ch
+		done := dl.done
+		total := dl.totalBatches
+		indices := dl.indices
+		dl.mu.Unlock()
+		go dl.prefetchWorker(ch, done, total, indices)
+		return
 	}
+	dl.mu.Unlock()
 }
 
 // HasNext reports whether there are more batches available this epoch.
 func (dl *DataLoader) HasNext() bool {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 	return dl.consumed < dl.totalBatches
 }
 
 // Next returns the next batch. Blocks if prefetch is not yet ready.
 func (dl *DataLoader) Next() Batch {
+	dl.mu.Lock()
+	if dl.consumed >= dl.totalBatches {
+		dl.mu.Unlock()
+		return Batch{}
+	}
+	idx := dl.consumed
 	dl.consumed++
 	if dl.prefetch > 0 {
-		return <-dl.ch
+		ch := dl.ch
+		dl.mu.Unlock()
+		b, ok := <-ch
+		if !ok {
+			return Batch{}
+		}
+		return b
 	}
-	return dl.loadBatch()
+	indices := dl.indices
+	dl.mu.Unlock()
+	return dl.loadBatchAt(idx, indices)
 }
 
 // NumBatches returns the total number of batches per epoch.
 func (dl *DataLoader) NumBatches() int {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	return dl.numBatchesLocked()
+}
+
+func (dl *DataLoader) numBatchesLocked() int {
 	n := dl.dataset.Len()
 	if dl.dropLast {
 		return n / dl.batchSize
@@ -116,30 +159,34 @@ func (dl *DataLoader) NumBatches() int {
 	return (n + dl.batchSize - 1) / dl.batchSize
 }
 
-// prefetchWorker loads all batches into the channel asynchronously.
-func (dl *DataLoader) prefetchWorker() {
-	defer close(dl.ch)
-	total := dl.totalBatches
+// prefetchWorker loads all batches into the channel asynchronously. It owns
+// the channel close (via defer) and reads its inputs by value so the main
+// goroutine can safely replace dl.ch / dl.done under the mutex.
+func (dl *DataLoader) prefetchWorker(ch chan<- Batch, done <-chan struct{}, total int, indices []int) {
+	defer close(ch)
 	for i := 0; i < total; i++ {
-		batch := dl.loadBatch()
+		batch := dl.loadBatchAt(i, indices)
 		select {
-		case <-dl.done:
+		case <-done:
 			return
-		case dl.ch <- batch:
+		case ch <- batch:
 		}
 	}
 }
 
-// loadBatch reads the next batch from dl.indices starting at dl.cursor.
-// NOTE: must not be called concurrently — cursor is not protected.
-func (dl *DataLoader) loadBatch() Batch {
-	n := dl.dataset.Len()
-	end := dl.cursor + dl.batchSize
+// loadBatchAt is a pure function of (batchIdx, indices): no shared state.
+// Safe to call concurrently from any goroutine.
+func (dl *DataLoader) loadBatchAt(batchIdx int, indices []int) Batch {
+	n := len(indices)
+	start := batchIdx * dl.batchSize
+	end := start + dl.batchSize
+	if start > n {
+		start = n
+	}
 	if end > n {
 		end = n
 	}
-	idxs := dl.indices[dl.cursor:end]
-	dl.cursor = end
+	idxs := indices[start:end]
 
 	var xRows, yRows []*tensor.Tensor
 	for _, i := range idxs {
