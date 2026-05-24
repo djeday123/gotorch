@@ -65,9 +65,23 @@ type divBackward struct {
 func (f *divBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
 	// d/da (a/b) = 1/b
 	// d/db (a/b) = -a/b^2
-	ga := unbroadcastGrad(tensor.Div(grad, f.bData), f.aShape)
+	//
+	// To prevent NaN/Inf when b contains exact zeros, we add a tiny epsilon
+	// to b² in the denominator and use the smooth reciprocal b/(b²+eps) for
+	// 1/b. Effects:
+	//   - |b| >> sqrt(eps): values are numerically indistinguishable from
+	//     the natural 1/b and 1/b².
+	//   - b == 0: smooth reciprocal evaluates to 0, so dga = 0 cleanly. dgb
+	//     becomes -grad*a/eps (very large but finite); upstream gradient
+	//     clipping can keep training stable instead of seeing NaN.
+	const divEps = 1e-12
+	b2 := tensor.AddScalar(tensor.Mul(f.bData, f.bData), divEps)
+	ga := unbroadcastGrad(
+		tensor.Div(tensor.Mul(grad, f.bData), b2),
+		f.aShape,
+	)
 	gb := unbroadcastGrad(
-		tensor.Neg(tensor.Div(tensor.Mul(grad, f.aData), tensor.Mul(f.bData, f.bData))),
+		tensor.Neg(tensor.Div(tensor.Mul(grad, f.aData), b2)),
 		f.bShape,
 	)
 	return []*tensor.Tensor{ga, gb}
