@@ -84,3 +84,144 @@ func Sigmoid(t *Tensor) *Tensor {
 func Tanh(t *Tensor) *Tensor {
 	return unary(t, func(x float64) float64 { return math.Tanh(x) })
 }
+
+// --- In-place ops ---
+//
+// These mutate the receiver tensor t and return it. They allocate nothing
+// (the whole point) — useful in optimizer steps and gradient accumulation
+// where the temporary tensors produced by Add()/Mul()/MulScalar() add up
+// to significant GC pressure in long training loops.
+//
+// Constraints:
+//   - Same shape required (no broadcasting): we operate element-wise over
+//     the underlying contiguous storage.
+//   - Both tensors must have the same dtype.
+//   - The receiver MUST be contiguous (panics otherwise) so we can iterate
+//     the storage directly. Non-contiguous (views/transposes) need to be
+//     materialised first via ContiguousCopy().
+//
+// To stay safe in autograd-tracked code paths the caller is responsible for
+// detaching gradients — modifying a Variable's underlying tensor while it
+// is still referenced by a computation graph will corrupt backward.
+
+func (t *Tensor) checkInPlaceSameShape(o *Tensor) {
+	if !t.isContiguous() {
+		panic("tensor: in-place op requires contiguous receiver — call ContiguousCopy() first")
+	}
+	if t.dtype != o.dtype {
+		panic("tensor: in-place op requires matching dtypes")
+	}
+	if len(t.shape) != len(o.shape) {
+		panic("tensor: in-place op requires matching shapes")
+	}
+	for i := range t.shape {
+		if t.shape[i] != o.shape[i] {
+			panic("tensor: in-place op requires matching shapes")
+		}
+	}
+}
+
+// AddInPlace adds o to t element-wise, returning t.
+func (t *Tensor) AddInPlace(o *Tensor) *Tensor {
+	t.checkInPlaceSameShape(o)
+	if t.dtype == Float32 {
+		oc := o
+		if !o.isContiguous() {
+			oc = o.ContiguousCopy()
+		}
+		for i := range t.f32 {
+			t.f32[i] += oc.f32[i]
+		}
+		return t
+	}
+	oc := o
+	if !o.isContiguous() {
+		oc = o.ContiguousCopy()
+	}
+	for i := range t.data {
+		t.data[i] += oc.data[i]
+	}
+	return t
+}
+
+// SubInPlace subtracts o from t element-wise, returning t.
+func (t *Tensor) SubInPlace(o *Tensor) *Tensor {
+	t.checkInPlaceSameShape(o)
+	if t.dtype == Float32 {
+		oc := o
+		if !o.isContiguous() {
+			oc = o.ContiguousCopy()
+		}
+		for i := range t.f32 {
+			t.f32[i] -= oc.f32[i]
+		}
+		return t
+	}
+	oc := o
+	if !o.isContiguous() {
+		oc = o.ContiguousCopy()
+	}
+	for i := range t.data {
+		t.data[i] -= oc.data[i]
+	}
+	return t
+}
+
+// MulInPlace multiplies t by o element-wise, returning t.
+func (t *Tensor) MulInPlace(o *Tensor) *Tensor {
+	t.checkInPlaceSameShape(o)
+	if t.dtype == Float32 {
+		oc := o
+		if !o.isContiguous() {
+			oc = o.ContiguousCopy()
+		}
+		for i := range t.f32 {
+			t.f32[i] *= oc.f32[i]
+		}
+		return t
+	}
+	oc := o
+	if !o.isContiguous() {
+		oc = o.ContiguousCopy()
+	}
+	for i := range t.data {
+		t.data[i] *= oc.data[i]
+	}
+	return t
+}
+
+// AddScalarInPlace adds s to every element of t, returning t.
+func (t *Tensor) AddScalarInPlace(s float64) *Tensor {
+	if !t.isContiguous() {
+		panic("tensor: in-place op requires contiguous receiver")
+	}
+	if t.dtype == Float32 {
+		sf := float32(s)
+		for i := range t.f32 {
+			t.f32[i] += sf
+		}
+		return t
+	}
+	for i := range t.data {
+		t.data[i] += s
+	}
+	return t
+}
+
+// MulScalarInPlace multiplies every element of t by s, returning t.
+func (t *Tensor) MulScalarInPlace(s float64) *Tensor {
+	if !t.isContiguous() {
+		panic("tensor: in-place op requires contiguous receiver")
+	}
+	if t.dtype == Float32 {
+		sf := float32(s)
+		for i := range t.f32 {
+			t.f32[i] *= sf
+		}
+		return t
+	}
+	for i := range t.data {
+		t.data[i] *= s
+	}
+	return t
+}

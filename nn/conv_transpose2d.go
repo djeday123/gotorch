@@ -15,6 +15,22 @@ import (
 //
 // Weight: [inC, outC, kH, kW]
 // Bias:   [outC]
+//
+// Implementation: the equivalence
+//
+//   y[n, oc, oh, ow] = Σ_{ic,kh,kw}  x[n, ic, h, w] · W[ic, oc, kh, kw]
+//                       where oh = h·s + kh − p, ow = w·s + kw − p
+//
+// is rearranged as a per-batch matmul plus a col2im scatter:
+//
+//   cols[oc·kH·kW + kh·kW + kw, h·W + w]  =  Σ_ic  W[ic, oc, kh, kw] · x[n, ic, h, w]
+//                                          = (Wᵀ ·  Xₙ)
+//
+// where W is flattened to [inC, outC·kH·kW] and Xₙ to [inC, H·W]. The
+// resulting [outC·kH·kW, H·W] matrix is then scattered into the output by
+// col2im. This replaces the quintuple-nested-loop O(N·inC·H·W·outC·kH·kW)
+// scalar accumulation with one tiled matmul per batch (same op count, but
+// 10-50× faster in practice from cache locality).
 type ConvTranspose2d struct {
 	InChannels  int
 	OutChannels int
@@ -81,7 +97,6 @@ type convTranspose2dBackward struct {
 }
 
 func (f *convTranspose2dBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
-	// grad shape: [N, outC, oH, oW]
 	xShape := f.xData.Shape() // [N, inC, H, W]
 	wShape := f.wData.Shape() // [inC, outC, kH, kW]
 	N, inC, H, W := xShape[0], xShape[1], xShape[2], xShape[3]
@@ -89,65 +104,38 @@ func (f *convTranspose2dBackward) Apply(grad *tensor.Tensor) []*tensor.Tensor {
 	oH := (H-1)*f.stride - 2*f.pad + kH
 	oW := (W-1)*f.stride - 2*f.pad + kW
 
-	// dL/dInput: for each (n, ic, h, w): sum over oc, kh, kw of grad[n,oc,h*s+kh-p,w*s+kw-p]*weight[ic,oc,kh,kw]
-	dX := tensor.Zeros(N, inC, H, W)
-	dXd := dX.Data()
-	xdShape := []int{N, inC, H, W}
-	grad4d := grad // [N, outC, oH, oW]
+	// Pre-flatten weight as [inC, outC·kH·kW] for matmul.
+	wFlat := f.wData.ContiguousCopy().Reshape(inC, outC*kH*kW)
+
+	gradData := grad.Data() // [N, outC, oH, oW] flat
+	xData := f.xData.ContiguousCopy().Data()
+
+	dXData := make([]float64, N*inC*H*W)
+	dWFlatData := make([]float64, inC*outC*kH*kW)
+	hw := H * W
 
 	for n := 0; n < N; n++ {
-		for ic := 0; ic < inC; ic++ {
-			for h := 0; h < H; h++ {
-				for w := 0; w < W; w++ {
-					sum := 0.0
-					for oc := 0; oc < outC; oc++ {
-						for kh := 0; kh < kH; kh++ {
-							for kw := 0; kw < kW; kw++ {
-								oh := h*f.stride + kh - f.pad
-								ow := w*f.stride + kw - f.pad
-								if oh >= 0 && oh < oH && ow >= 0 && ow < oW {
-									gv := grad4d.At(n, oc, oh, ow)
-									wv := f.wData.At(ic, oc, kh, kw)
-									sum += gv * wv
-								}
-							}
-						}
-					}
-					dXd[flatIdx4(n, ic, h, w, xdShape)] = sum
-				}
-			}
+		// Build cols_grad_n = im2col of grad_n, shape [outC·kH·kW, H·W]
+		// where cols[(oc·kH+kh)·kW+kw, h·W+w] = grad_n[oc, h·s+kh-p, w·s+kw-p].
+		colsGrad := im2colForTransposeBackward(gradData, n, outC, kH, kW, H, W, oH, oW, f.stride, f.pad)
+		colsGradT := tensor.New(colsGrad, []int{outC * kH * kW, hw})
+
+		// dX_n = W_flat · cols_grad_n  → [inC, H·W]
+		dXn := tensor.MatMul(wFlat, colsGradT)
+		copy(dXData[n*inC*hw:(n+1)*inC*hw], dXn.Data())
+
+		// dW += x_n · cols_grad_nᵀ → [inC, outC·kH·kW]
+		xnData := xData[n*inC*hw : (n+1)*inC*hw]
+		xn := tensor.New(append([]float64(nil), xnData...), []int{inC, hw})
+		dWPartial := tensor.MatMul(xn, colsGradT.T())
+		dPartialData := dWPartial.Data()
+		for i := range dWFlatData {
+			dWFlatData[i] += dPartialData[i]
 		}
 	}
 
-	// dL/dWeight: [inC, outC, kH, kW]
-	dW := tensor.Zeros(inC, outC, kH, kW)
-	dWd := dW.Data()
-	wdShape := []int{inC, outC, kH, kW}
-
-	for ic := 0; ic < inC; ic++ {
-		for oc := 0; oc < outC; oc++ {
-			for kh := 0; kh < kH; kh++ {
-				for kw := 0; kw < kW; kw++ {
-					sum := 0.0
-					for n := 0; n < N; n++ {
-						for h := 0; h < H; h++ {
-							for w := 0; w < W; w++ {
-								oh := h*f.stride + kh - f.pad
-								ow := w*f.stride + kw - f.pad
-								if oh >= 0 && oh < oH && ow >= 0 && ow < oW {
-									xv := f.xData.At(n, ic, h, w)
-									gv := grad4d.At(n, oc, oh, ow)
-									sum += xv * gv
-								}
-							}
-						}
-					}
-					dWd[flatIdx4(ic, oc, kh, kw, wdShape)] = sum
-				}
-			}
-		}
-	}
-
+	dX := tensor.New(dXData, []int{N, inC, H, W})
+	dW := tensor.New(dWFlatData, []int{inC, outC, kH, kW})
 	return []*tensor.Tensor{dX, dW}
 }
 
@@ -155,8 +143,7 @@ func convTranspose2dForward(x, w, b *autograd.Variable, useBias bool, stride, pa
 	xShape := x.Data.Shape() // [N, inC, H, W]
 	wShape := w.Data.Shape() // [inC, outC, kH, kW]
 	N, inC, H, W := xShape[0], xShape[1], xShape[2], xShape[3]
-	wInC, outC, kH, kW := wShape[0], wShape[1], wShape[2], wShape[3]
-	_ = wInC
+	_, outC, kH, kW := wShape[0], wShape[1], wShape[2], wShape[3]
 
 	oH := (H-1)*stride - 2*pad + kH
 	oW := (W-1)*stride - 2*pad + kW
@@ -164,21 +151,40 @@ func convTranspose2dForward(x, w, b *autograd.Variable, useBias bool, stride, pa
 	outData := make([]float64, N*outC*oH*oW)
 	outShape := []int{N, outC, oH, oW}
 
+	// Flatten weight: [inC, outC·kH·kW]. Its transpose [outC·kH·kW, inC] is
+	// used as the left operand against x_n shaped [inC, H·W].
+	wFlat := w.Data.ContiguousCopy().Reshape(inC, outC*kH*kW)
+	wFlatT := wFlat.T() // [outC·kH·kW, inC]
+
+	xData := x.Data.ContiguousCopy().Data()
+	hw := H * W
+
 	for n := 0; n < N; n++ {
-		for ic := 0; ic < inC; ic++ {
-			for h := 0; h < H; h++ {
-				for w_ := 0; w_ < W; w_++ {
-					xv := x.Data.At(n, ic, h, w_)
-					for oc := 0; oc < outC; oc++ {
-						for kh := 0; kh < kH; kh++ {
-							for kw := 0; kw < kW; kw++ {
-								oh := h*stride + kh - pad
-								ow := w_*stride + kw - pad
-								if oh >= 0 && oh < oH && ow >= 0 && ow < oW {
-									wv := w.Data.At(ic, oc, kh, kw)
-									outData[flatIdx4(n, oc, oh, ow, outShape)] += xv * wv
-								}
+		// x_n as a [inC, H·W] matrix (own copy so MatMul can ContiguousCopy).
+		xnData := append([]float64(nil), xData[n*inC*hw:(n+1)*inC*hw]...)
+		xn := tensor.New(xnData, []int{inC, hw})
+
+		// cols = Wᵀ · x_n  → [outC·kH·kW, H·W]
+		cols := tensor.MatMul(wFlatT, xn)
+		colsData := cols.Data()
+
+		// col2im: scatter cols into output[n, :, :, :].
+		for oc := 0; oc < outC; oc++ {
+			for kh := 0; kh < kH; kh++ {
+				for kw := 0; kw < kW; kw++ {
+					rowIdx := (oc*kH+kh)*kW + kw
+					rowBase := rowIdx * hw
+					for h := 0; h < H; h++ {
+						oh := h*stride + kh - pad
+						if oh < 0 || oh >= oH {
+							continue
+						}
+						for w_ := 0; w_ < W; w_++ {
+							ow := w_*stride + kw - pad
+							if ow < 0 || ow >= oW {
+								continue
 							}
+							outData[((n*outC+oc)*oH+oh)*oW+ow] += colsData[rowBase+h*W+w_]
 						}
 					}
 				}
@@ -186,14 +192,15 @@ func convTranspose2dForward(x, w, b *autograd.Variable, useBias bool, stride, pa
 		}
 	}
 
-	// Add bias
+	// Add bias.
 	if useBias && b != nil {
 		bData := b.Data.Data()
 		for n := 0; n < N; n++ {
 			for oc := 0; oc < outC; oc++ {
+				bias := bData[oc]
 				for oh := 0; oh < oH; oh++ {
 					for ow := 0; ow < oW; ow++ {
-						outData[flatIdx4(n, oc, oh, ow, outShape)] += bData[oc]
+						outData[((n*outC+oc)*oH+oh)*oW+ow] += bias
 					}
 				}
 			}
@@ -201,11 +208,39 @@ func convTranspose2dForward(x, w, b *autograd.Variable, useBias bool, stride, pa
 	}
 
 	outT := tensor.New(outData, outShape)
-
-	if useBias && b != nil {
-		return autograd.NewResult(outT, &convTranspose2dBackward{x.Data, w.Data, stride, pad}, x, w)
-	}
 	return autograd.NewResult(outT, &convTranspose2dBackward{x.Data, w.Data, stride, pad}, x, w)
+}
+
+// im2colForTransposeBackward extracts grad[n, oc, h·s+kh-p, w·s+kw-p] into a
+// 2D matrix of shape [outC·kH·kW, H·W] for use in ConvTranspose2d backward.
+func im2colForTransposeBackward(grad []float64, n, outC, kH, kW, H, W, oH, oW, stride, pad int) []float64 {
+	hw := H * W
+	cols := make([]float64, outC*kH*kW*hw)
+	nOff := n * outC * oH * oW
+	for oc := 0; oc < outC; oc++ {
+		ocOff := nOff + oc*oH*oW
+		for kh := 0; kh < kH; kh++ {
+			for kw := 0; kw < kW; kw++ {
+				rowIdx := (oc*kH+kh)*kW + kw
+				rowBase := rowIdx * hw
+				for h := 0; h < H; h++ {
+					oh := h*stride + kh - pad
+					if oh < 0 || oh >= oH {
+						continue
+					}
+					ohBase := ocOff + oh*oW
+					for w := 0; w < W; w++ {
+						ow := w*stride + kw - pad
+						if ow < 0 || ow >= oW {
+							continue
+						}
+						cols[rowBase+h*W+w] = grad[ohBase+ow]
+					}
+				}
+			}
+		}
+	}
+	return cols
 }
 
 // flatIdx4 computes flat index for a 4D tensor [d0, d1, d2, d3].

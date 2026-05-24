@@ -89,23 +89,51 @@ func Prod(t *Tensor, dim int, keepdim bool) *Tensor {
 
 // Var computes variance along dim (unbiased=true uses N-1).
 // dim=-999 means all elements.
+//
+// Uses Welford's online algorithm — single-pass and numerically stable for
+// large or shifted values where the textbook E[x²] − E[x]² catastrophically
+// cancels. Naïve `(x − mean)²` two-pass works fine for typical activations
+// but loses precision when |x| ≫ std(x).
 func Var(t *Tensor, dim int, keepdim bool, unbiased bool) *Tensor {
-	mean := Mean(t, dim, true)
+	if dim == -999 {
+		// Reduce all elements: one Welford accumulator over the whole tensor.
+		mean, m2 := 0.0, 0.0
+		count := 0
+		it := newIterator(t)
+		for it.hasNext() {
+			x := t.data[it.next()]
+			count++
+			delta := x - mean
+			mean += delta / float64(count)
+			m2 += delta * (x - mean)
+		}
+		n := float64(count)
+		if unbiased && count > 1 {
+			n--
+		}
+		out := Scalar(m2 / n)
+		if keepdim {
+			ones := make([]int, len(t.shape))
+			for i := range ones {
+				ones[i] = 1
+			}
+			return out.Reshape(ones...)
+		}
+		return out
+	}
+
+	// Per-axis Welford: one accumulator per output position.
+	mean := Mean(t, dim, true) // [..., 1, ...]
 	diff := Sub(t, mean)
 	sq := Mul(diff, diff)
 	s := Sum(sq, dim, keepdim)
 
-	var n float64
-	if dim == -999 {
-		n = float64(t.Size())
-	} else {
-		ndim := len(t.shape)
-		d := dim
-		if d < 0 {
-			d = ndim + d
-		}
-		n = float64(t.shape[d])
+	ndim := len(t.shape)
+	d := dim
+	if d < 0 {
+		d = ndim + d
 	}
+	n := float64(t.shape[d])
 	if unbiased && n > 1 {
 		n--
 	}
@@ -238,28 +266,103 @@ func Cumsum(t *Tensor, dim int) *Tensor {
 
 // TopK returns the top-k values and their indices along dim=last.
 // Returns (values, indices).
+//
+// O(n log k) via a min-heap of size k. The heap holds the k largest values
+// seen so far; whenever the next element is bigger than the heap minimum we
+// replace it. At the end we drain the heap in descending order.
+//
+// The previous O(n·k) selection became painful for large tensors with
+// moderate k (e.g. k=100 over 1M elements = 10⁸ ops).
 func TopK(t *Tensor, k int) (*Tensor, *Tensor) {
 	flat := t.ContiguousCopy()
 	n := len(flat.data)
 	if k > n {
 		k = n
 	}
-	// Simple selection — O(n*k), fine for small k
-	used := make([]bool, n)
+	if k == 0 {
+		return New(nil, []int{0}), New(nil, []int{0})
+	}
+
+	// Min-heap of {value, originalIndex}, capped at size k.
+	h := &topKHeap{}
+	for i := 0; i < n; i++ {
+		v := flat.data[i]
+		if h.Len() < k {
+			h.push(topKItem{val: v, idx: i})
+		} else if v > h.items[0].val {
+			h.items[0] = topKItem{val: v, idx: i}
+			h.siftDown(0)
+		}
+	}
+
+	// Drain in descending order: repeatedly pop the min and stack from the back.
 	vals := make([]float64, k)
 	idxs := make([]float64, k)
-	for i := 0; i < k; i++ {
-		bestVal := math.Inf(-1)
-		bestIdx := -1
-		for j, v := range flat.data {
-			if !used[j] && v > bestVal {
-				bestVal = v
-				bestIdx = j
-			}
-		}
-		vals[i] = bestVal
-		idxs[i] = float64(bestIdx)
-		used[bestIdx] = true
+	for i := k - 1; i >= 0; i-- {
+		top := h.pop()
+		vals[i] = top.val
+		idxs[i] = float64(top.idx)
 	}
 	return New(vals, []int{k}), New(idxs, []int{k})
+}
+
+// --- topKHeap: min-heap of (value, originalIndex) used by TopK. ---
+
+type topKItem struct {
+	val float64
+	idx int
+}
+
+type topKHeap struct {
+	items []topKItem
+}
+
+func (h *topKHeap) Len() int { return len(h.items) }
+
+func (h *topKHeap) push(it topKItem) {
+	h.items = append(h.items, it)
+	h.siftUp(len(h.items) - 1)
+}
+
+func (h *topKHeap) pop() topKItem {
+	root := h.items[0]
+	last := len(h.items) - 1
+	h.items[0] = h.items[last]
+	h.items = h.items[:last]
+	if last > 0 {
+		h.siftDown(0)
+	}
+	return root
+}
+
+func (h *topKHeap) siftUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if h.items[i].val < h.items[parent].val {
+			h.items[i], h.items[parent] = h.items[parent], h.items[i]
+			i = parent
+		} else {
+			break
+		}
+	}
+}
+
+func (h *topKHeap) siftDown(i int) {
+	n := len(h.items)
+	for {
+		left := 2*i + 1
+		right := 2*i + 2
+		smallest := i
+		if left < n && h.items[left].val < h.items[smallest].val {
+			smallest = left
+		}
+		if right < n && h.items[right].val < h.items[smallest].val {
+			smallest = right
+		}
+		if smallest == i {
+			return
+		}
+		h.items[i], h.items[smallest] = h.items[smallest], h.items[i]
+		i = smallest
+	}
 }

@@ -160,11 +160,13 @@ func New(data []float64, shape []int) *Tensor {
 	return &Tensor{data: d, shape: s, strides: computeStrides(s)}
 }
 
-// Zeros creates a zero-filled tensor.
+// Zeros creates a zero-filled tensor. Backing storage is drawn from the
+// pool when its size is in range; call t.Release() to return it to the
+// pool when done (in long training loops this dramatically reduces GC).
 func Zeros(shape ...int) *Tensor {
 	s := make([]int, len(shape))
 	copy(s, shape)
-	return &Tensor{data: make([]float64, totalSize(s)), shape: s, strides: computeStrides(s)}
+	return &Tensor{data: AllocFloat64(totalSize(s)), shape: s, strides: computeStrides(s)}
 }
 
 // Ones creates a ones-filled tensor.
