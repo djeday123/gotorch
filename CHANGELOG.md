@@ -6,21 +6,23 @@ All notable changes to gotorch are documented here. Format roughly follows
 
 ## [Unreleased]
 
-— v5.1.0 cut on 2026-05-24; no unreleased changes pending at this time.
+— v6.0.0 cut on 2026-05-24; no unreleased changes pending at this time.
 
 ---
 
-## [v5.1.0] — 2026-05-24
+## [v6.0.0] — 2026-05-24 — first properly working release
 
-Stability and performance release on top of v5.0.0. Ten silent backward-pass
-bugs found and fixed (each verified by a numerical-gradient test), Float32
-dtype preservation in matmul, concurrency-safety repairs, and several
-performance improvements that leave the public API backward-compatible.
+This is the first release of gotorch where the autograd is actually
+correct. Earlier `v1.0.0` … `v5.0.0` builds shipped silent bugs in
+backward passes for `LSTM`, `GRU`, `MultiHeadAttention`, `LayerNorm`,
+`BatchNorm1d`, `GroupNorm`, `Sum`, `Mean`, and `Softmax`. Training with
+those releases produced wrong gradients that just happened to converge
+for simple problems.
 
-If you trained with v5.0.0 or earlier and used `LSTM`, `GRU`,
-`MultiHeadAttention`, `LayerNorm`, `BatchNorm1d`, `GroupNorm`, `Sum`,
-`Mean`, or `Softmax` in a way that relied on gradients, your gradients
-were silently wrong. They are now correct.
+If you trained with v5.0.0 or earlier — re-train. Pin to v6.0.0+ going
+forward. The major-version bump signals a behavioural change for anyone
+who inadvertently depended on the broken gradient values. Public APIs
+are otherwise unchanged.
 
 ### Fixed — critical backward-pass bugs (commit `28284e8`)
 
@@ -133,5 +135,5 @@ features per "Level":
 * **v1.1.0** — Level 1: Float32, Conv2d, NoGrad, Cat/Stack/Split
 * **v1.0.0** — Foundation: tensor, autograd, Linear, SGD, Adam, CUDA
 
-[Unreleased]: https://github.com/djeday123/gotorch/compare/v5.1.0...HEAD
-[v5.1.0]: https://github.com/djeday123/gotorch/releases/tag/v5.1.0
+[Unreleased]: https://github.com/djeday123/gotorch/compare/v6.0.0...HEAD
+[v6.0.0]: https://github.com/djeday123/gotorch/releases/tag/v6.0.0
