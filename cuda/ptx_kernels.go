@@ -1,0 +1,2116 @@
+package cuda
+
+// PTX-ядра, скомпилированные в строку и загружаемые через cuModuleLoadData
+// при инициализации PuregoBackend. .target sm_80 - forward-compatible JIT
+// покрывает всё sm_80+, включая Blackwell sm_120 (проверено goml).
+//
+// Схема: одномерная сетка, block=256 threads, grid = ceil(n/256).
+// Формат: one statement per line - некоторые ptxas-версии не принимают
+// multiple statements per line через ';' разделитель, стилево NVIDIA
+// использует one-per-line во всех sample PTX. См. отчёт stage4 §PTX-format.
+
+const r02bKernelsPTX = `
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry add_f64(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f64 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ladd_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    ld.global.f64 %vb, [%pb];
+    add.f64 %vc, %va, %vb;
+    st.global.f64 [%pd], %vc;
+$Ladd_f64_done:
+    ret;
+}
+
+.visible .entry add_f32(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f32 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ladd_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    ld.global.f32 %vb, [%pb];
+    add.f32 %vc, %va, %vb;
+    st.global.f32 [%pd], %vc;
+$Ladd_f32_done:
+    ret;
+}
+
+.visible .entry sub_f64(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f64 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsub_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    ld.global.f64 %vb, [%pb];
+    sub.f64 %vc, %va, %vb;
+    st.global.f64 [%pd], %vc;
+$Lsub_f64_done:
+    ret;
+}
+
+.visible .entry sub_f32(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f32 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsub_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    ld.global.f32 %vb, [%pb];
+    sub.f32 %vc, %va, %vb;
+    st.global.f32 [%pd], %vc;
+$Lsub_f32_done:
+    ret;
+}
+
+.visible .entry mul_f64(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f64 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lmul_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    ld.global.f64 %vb, [%pb];
+    mul.f64 %vc, %va, %vb;
+    st.global.f64 [%pd], %vc;
+$Lmul_f64_done:
+    ret;
+}
+
+.visible .entry mul_f32(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f32 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lmul_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    ld.global.f32 %vb, [%pb];
+    mul.f32 %vc, %va, %vb;
+    st.global.f32 [%pd], %vc;
+$Lmul_f32_done:
+    ret;
+}
+
+.visible .entry div_f64(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f64 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ldiv_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    ld.global.f64 %vb, [%pb];
+    div.rn.f64 %vc, %va, %vb;
+    st.global.f64 [%pd], %vc;
+$Ldiv_f64_done:
+    ret;
+}
+
+.visible .entry div_f32(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %b, %dst, %off, %pa, %pb, %pd;
+    .reg .f32 %va, %vb, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %b, [p_b];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ldiv_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pb, %b, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    ld.global.f32 %vb, [%pb];
+    div.rn.f32 %vc, %va, %vb;
+    st.global.f32 [%pd], %vc;
+$Ldiv_f32_done:
+    ret;
+}
+
+.visible .entry neg_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f64 %va, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lneg_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    neg.f64 %vc, %va;
+    st.global.f64 [%pd], %vc;
+$Lneg_f64_done:
+    ret;
+}
+
+.visible .entry neg_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lneg_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    neg.f32 %vc, %va;
+    st.global.f32 [%pd], %vc;
+$Lneg_f32_done:
+    ret;
+}
+
+.visible .entry addscalar_f64(
+    .param .u64 p_a,
+    .param .f64 p_scalar,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f64 %va, %vc, %s;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.f64 %s, [p_scalar];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Laddscalar_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    add.f64 %vc, %va, %s;
+    st.global.f64 [%pd], %vc;
+$Laddscalar_f64_done:
+    ret;
+}
+
+.visible .entry addscalar_f32(
+    .param .u64 p_a,
+    .param .f32 p_scalar,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %s;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.f32 %s, [p_scalar];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Laddscalar_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    add.f32 %vc, %va, %s;
+    st.global.f32 [%pd], %vc;
+$Laddscalar_f32_done:
+    ret;
+}
+
+.visible .entry mulscalar_f64(
+    .param .u64 p_a,
+    .param .f64 p_scalar,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f64 %va, %vc, %s;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.f64 %s, [p_scalar];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lmulscalar_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    mul.f64 %vc, %va, %s;
+    st.global.f64 [%pd], %vc;
+$Lmulscalar_f64_done:
+    ret;
+}
+
+.visible .entry mulscalar_f32(
+    .param .u64 p_a,
+    .param .f32 p_scalar,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %s;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.f32 %s, [p_scalar];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lmulscalar_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mul.f32 %vc, %va, %s;
+    st.global.f32 [%pd], %vc;
+$Lmulscalar_f32_done:
+    ret;
+}
+
+.visible .entry exp_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %log2e;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lexp_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mov.f32 %log2e, 0f3FB8AA3B;
+    mul.f32 %vc, %va, %log2e;
+    ex2.approx.f32 %vc, %vc;
+    st.global.f32 [%pd], %vc;
+$Lexp_f32_done:
+    ret;
+}
+
+.visible .entry log_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %ln2;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Llog_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    lg2.approx.f32 %vc, %va;
+    mov.f32 %ln2, 0f3F317218;
+    mul.f32 %vc, %vc, %ln2;
+    st.global.f32 [%pd], %vc;
+$Llog_f32_done:
+    ret;
+}
+
+// exp_f64: fdlibm/musl e_exp.c port. Basic path for x in [-745, 709].
+.visible .entry exp_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %zero32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %x, %invln2, %ln2H, %ln2L;
+    .reg .f64 %P1, %P2, %P3, %P4, %P5;
+    .reg .f64 %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %c, %y, %twopk, %result;
+    .reg .s32 %k_int, %expo;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lexp_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mov.f64 %two,    0d4000000000000000;
+
+    // k = round(x * invln2)
+    mul.f64 %k_fp, %x, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+
+    // hi = x - k*ln2H
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %x, %hi;
+    // lo = k*ln2L
+    mul.f64 %lo, %k_fp, %ln2L;
+    // r = hi - lo
+    sub.f64 %r, %hi, %lo;
+    // t = r*r
+    mul.f64 %t, %r, %r;
+
+    // Horner: c = P1 + t*(P2 + t*(P3 + t*(P4 + t*P5)))
+    mul.f64 %c, %P5, %t;
+    add.f64 %c, %c, %P4;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P3;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P2;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P1;
+    // c = r - t * (P1 + ...)
+    mul.f64 %c, %c, %t;
+    sub.f64 %c, %r, %c;
+
+    // y = 1 - ((lo - r*c/(2-c)) - hi)
+    sub.f64 %t, %two, %c;
+    mul.f64 %r, %r, %c;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+
+    // twopk = 2^k via bit manipulation of FP64 exponent field
+    add.s32 %expo, %k_int, 1023;
+    shl.b32 %expo, %expo, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expo};
+    mov.f64 %twopk, %twopk_bits;
+
+    // result = y * twopk
+    mul.f64 %result, %y, %twopk;
+    st.global.f64 [%pd], %result;
+$Lexp_f64_done:
+    ret;
+}
+
+// log_f64: fdlibm/musl e_log.c port (basic path).
+// Same schema as Go math.Log: extract k and mantissa in [sqrt(2)/2, sqrt(2)),
+// polynomial in s = f/(2+f) using constants Lg1..Lg7 from fdlibm.
+//
+// Schema:
+//   Extract bits: k = exponent(x) - 1023 with sqrt(2)/2 boundary shift
+//   Reduce x to m in [sqrt(2)/2, sqrt(2))
+//   f = m - 1
+//   hfsq = 0.5*f*f
+//   s = f / (2 + f)
+//   z = s*s ;  w = z*z
+//   t1 = w*(Lg2 + w*(Lg4 + w*Lg6))
+//   t2 = z*(Lg1 + w*(Lg3 + w*(Lg5 + w*Lg7)))
+//   R  = t2 + t1
+//   ret = s*(hfsq+R) + k*ln2_lo - hfsq + f + k*ln2_hi
+// ============================================================
+.visible .entry log_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %hi32, %lo32, %tmp32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %xbits, %mbits;
+    .reg .f64 %x, %m, %f, %hfsq, %s, %z, %w;
+    .reg .f64 %Lg1, %Lg2, %Lg3, %Lg4, %Lg5, %Lg6, %Lg7;
+    .reg .f64 %ln2H, %ln2L, %half, %two, %dk;
+    .reg .f64 %t1, %t2, %R, %result, %tmpfp;
+    .reg .s32 %k_int;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Llog_f64_done;
+
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+
+    // Constants (fdlibm)
+    mov.f64 %Lg1, 0d3FE5555555555593;
+    mov.f64 %Lg2, 0d3FD999999997FA04;
+    mov.f64 %Lg3, 0d3FD2492494229359;
+    mov.f64 %Lg4, 0d3FCC71C51D8E78AF;
+    mov.f64 %Lg5, 0d3FC7466496CB03DE;
+    mov.f64 %Lg6, 0d3FC39A09D078C69F;
+    mov.f64 %Lg7, 0d3FC2F112DF3E5244;
+    mov.f64 %ln2H, 0d3FE62E42FEE00000;
+    mov.f64 %ln2L, 0d3DEA39EF35793C76;
+    mov.f64 %half, 0d3FE0000000000000;
+    mov.f64 %two,  0d4000000000000000;
+
+    // Extract hi32 = high 32 bits of x (as bits).
+    mov.b64 %xbits, %x;
+    mov.b64 {%lo32, %hi32}, %xbits;
+
+    // k adjustment via boundary shift:
+    //   hi += 0x3ff00000 - 0x3fe6a09e = 0x00095f62
+    //   k  = ((int32_t)hi >> 20) - 0x3ff
+    //   hi = (hi & 0x000fffff) + 0x3fe6a09e
+    add.s32 %hi32, %hi32, 0x00095F62;
+    shr.s32 %k_int, %hi32, 20;
+    sub.s32 %k_int, %k_int, 0x3FF;
+    and.b32 %tmp32, %hi32, 0x000FFFFF;
+    add.s32 %tmp32, %tmp32, 0x3FE6A09E;
+    // Reassemble m: hi=%tmp32, lo unchanged
+    mov.b64 %mbits, {%lo32, %tmp32};
+    mov.f64 %m, %mbits;
+
+    // f = m - 1
+    mov.f64 %tmpfp, 0d3FF0000000000000;
+    sub.f64 %f, %m, %tmpfp;
+
+    // hfsq = 0.5 * f * f
+    mul.f64 %hfsq, %f, %f;
+    mul.f64 %hfsq, %hfsq, %half;
+
+    // s = f / (2 + f)
+    add.f64 %s, %f, %two;
+    div.rn.f64 %s, %f, %s;
+
+    // z = s*s ; w = z*z
+    mul.f64 %z, %s, %s;
+    mul.f64 %w, %z, %z;
+
+    // t1 = w*(Lg2 + w*(Lg4 + w*Lg6))
+    mul.f64 %t1, %w, %Lg6;
+    add.f64 %t1, %t1, %Lg4;
+    mul.f64 %t1, %t1, %w;
+    add.f64 %t1, %t1, %Lg2;
+    mul.f64 %t1, %t1, %w;
+
+    // t2 = z*(Lg1 + w*(Lg3 + w*(Lg5 + w*Lg7)))
+    mul.f64 %t2, %w, %Lg7;
+    add.f64 %t2, %t2, %Lg5;
+    mul.f64 %t2, %t2, %w;
+    add.f64 %t2, %t2, %Lg3;
+    mul.f64 %t2, %t2, %w;
+    add.f64 %t2, %t2, %Lg1;
+    mul.f64 %t2, %t2, %z;
+
+    // R = t2 + t1
+    add.f64 %R, %t2, %t1;
+
+    // dk = (double)k
+    cvt.rn.f64.s32 %dk, %k_int;
+
+    // result = s*(hfsq+R) + dk*ln2_lo - hfsq + f + dk*ln2_hi
+    add.f64 %tmpfp, %hfsq, %R;
+    mul.f64 %result, %s, %tmpfp;
+    // + dk * ln2L
+    mul.f64 %tmpfp, %dk, %ln2L;
+    add.f64 %result, %result, %tmpfp;
+    // - hfsq
+    sub.f64 %result, %result, %hfsq;
+    // + f
+    add.f64 %result, %result, %f;
+    // + dk * ln2H
+    mul.f64 %tmpfp, %dk, %ln2H;
+    add.f64 %result, %result, %tmpfp;
+
+    st.global.f64 [%pd], %result;
+
+$Llog_f64_done:
+    ret;
+}
+
+// relu_f32: c = max(a, 0)
+.visible .entry relu_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %zero;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mov.f32 %zero, 0f00000000;
+    max.f32 %vc, %va, %zero;
+    st.global.f32 [%pd], %vc;
+$Lrelu_f32_done:
+    ret;
+}
+
+// relu_f64
+.visible .entry relu_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f64 %va, %vc, %zero;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    mov.f64 %zero, 0d0000000000000000;
+    max.f64 %vc, %va, %zero;
+    st.global.f64 [%pd], %vc;
+$Lrelu_f64_done:
+    ret;
+}
+
+// sigmoid_f32: c = 1 / (1 + exp(-x)) via ex2.approx.f32
+.visible .entry sigmoid_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %log2e, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mov.f32 %log2e, 0f3FB8AA3B;
+    mov.f32 %one,   0f3F800000;
+    neg.f32 %t, %va;
+    mul.f32 %t, %t, %log2e;
+    ex2.approx.f32 %t, %t;
+    add.f32 %t, %t, %one;
+    rcp.approx.f32 %vc, %t;
+    st.global.f32 [%pd], %vc;
+$Lsigmoid_f32_done:
+    ret;
+}
+
+// tanh_f32: c = tanh(x) via aparatnyy tanh.approx.f32
+.visible .entry tanh_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    tanh.approx.f32 %vc, %va;
+    st.global.f32 [%pd], %vc;
+$Ltanh_f32_done:
+    ret;
+}
+
+// sigmoid_f64: c = 1 / (1 + exp(-x)) with inline fdlibm exp
+.visible .entry sigmoid_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %zero32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %x, %negx, %invln2, %ln2H, %ln2L;
+    .reg .f64 %P1, %P2, %P3, %P4, %P5, %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %c, %y, %twopk, %expmx, %result;
+    .reg .s32 %k_int, %expo;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+    neg.f64 %negx, %x;
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mov.f64 %two,    0d4000000000000000;
+    mul.f64 %k_fp, %negx, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %negx, %hi;
+    mul.f64 %lo, %k_fp, %ln2L;
+    sub.f64 %r, %hi, %lo;
+    mul.f64 %t, %r, %r;
+    mul.f64 %c, %P5, %t;
+    add.f64 %c, %c, %P4;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P3;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P2;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P1;
+    mul.f64 %c, %c, %t;
+    sub.f64 %c, %r, %c;
+    sub.f64 %t, %two, %c;
+    mul.f64 %r, %r, %c;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+    add.s32 %expo, %k_int, 1023;
+    shl.b32 %expo, %expo, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expo};
+    mov.f64 %twopk, %twopk_bits;
+    mul.f64 %expmx, %y, %twopk;
+    add.f64 %t, %expmx, %one;
+    div.rn.f64 %result, %one, %t;
+    st.global.f64 [%pd], %result;
+$Lsigmoid_f64_done:
+    ret;
+}
+
+// tanh_f64: c = (exp(2x) - 1) / (exp(2x) + 1) with inline fdlibm exp
+.visible .entry tanh_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %zero32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %x, %twox, %invln2, %ln2H, %ln2L;
+    .reg .f64 %P1, %P2, %P3, %P4, %P5, %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %c, %y, %twopk, %e2x, %num, %denom, %result;
+    .reg .s32 %k_int, %expo;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+    mov.f64 %two, 0d4000000000000000;
+    mul.f64 %twox, %x, %two;
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mul.f64 %k_fp, %twox, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %twox, %hi;
+    mul.f64 %lo, %k_fp, %ln2L;
+    sub.f64 %r, %hi, %lo;
+    mul.f64 %t, %r, %r;
+    mul.f64 %c, %P5, %t;
+    add.f64 %c, %c, %P4;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P3;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P2;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P1;
+    mul.f64 %c, %c, %t;
+    sub.f64 %c, %r, %c;
+    sub.f64 %t, %two, %c;
+    mul.f64 %r, %r, %c;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+    add.s32 %expo, %k_int, 1023;
+    shl.b32 %expo, %expo, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expo};
+    mov.f64 %twopk, %twopk_bits;
+    mul.f64 %e2x, %y, %twopk;
+    sub.f64 %num, %e2x, %one;
+    add.f64 %denom, %e2x, %one;
+    div.rn.f64 %result, %num, %denom;
+    st.global.f64 [%pd], %result;
+$Ltanh_f64_done:
+    ret;
+}
+
+// relu_grad_f32: dX = (X > 0) ? dY : 0
+.visible .entry relu_grad_f32(
+    .param .u64 p_x,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %x, %dy, %dst, %off, %px, %pdy, %pd;
+    .reg .f32 %vx, %vdy, %vc, %zero;
+    .reg .pred %pmask, %p;
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %px, %x, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vx, [%px];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %zero, 0f00000000;
+    setp.gt.f32 %pmask, %vx, %zero;
+    selp.f32 %vc, %vdy, %zero, %pmask;
+    st.global.f32 [%pd], %vc;
+$Lrelu_grad_f32_done:
+    ret;
+}
+
+// relu_grad_f64
+.visible .entry relu_grad_f64(
+    .param .u64 p_x,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %x, %dy, %dst, %off, %px, %pdy, %pd;
+    .reg .f64 %vx, %vdy, %vc, %zero;
+    .reg .pred %pmask, %p;
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %px, %x, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vx, [%px];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %zero, 0d0000000000000000;
+    setp.gt.f64 %pmask, %vx, %zero;
+    selp.f64 %vc, %vdy, %zero, %pmask;
+    st.global.f64 [%pd], %vc;
+$Lrelu_grad_f64_done:
+    ret;
+}
+
+// sigmoid_grad_f32: dX = dY * Y * (1 - Y)
+.visible .entry sigmoid_grad_f32(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f32 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vy, [%py];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %one, 0f3F800000;
+    sub.f32 %t, %one, %vy;
+    mul.f32 %t, %t, %vy;
+    mul.f32 %vc, %vdy, %t;
+    st.global.f32 [%pd], %vc;
+$Lsigmoid_grad_f32_done:
+    ret;
+}
+
+// sigmoid_grad_f64
+.visible .entry sigmoid_grad_f64(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f64 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vy, [%py];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %one, 0d3FF0000000000000;
+    sub.f64 %t, %one, %vy;
+    mul.f64 %t, %t, %vy;
+    mul.f64 %vc, %vdy, %t;
+    st.global.f64 [%pd], %vc;
+$Lsigmoid_grad_f64_done:
+    ret;
+}
+
+// tanh_grad_f32: dX = dY * (1 - Y*Y)
+.visible .entry tanh_grad_f32(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f32 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vy, [%py];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %one, 0f3F800000;
+    mul.f32 %t, %vy, %vy;
+    sub.f32 %t, %one, %t;
+    mul.f32 %vc, %vdy, %t;
+    st.global.f32 [%pd], %vc;
+$Ltanh_grad_f32_done:
+    ret;
+}
+
+// tanh_grad_f64
+.visible .entry tanh_grad_f64(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f64 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vy, [%py];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %one, 0d3FF0000000000000;
+    mul.f64 %t, %vy, %vy;
+    sub.f64 %t, %one, %t;
+    mul.f64 %vc, %vdy, %t;
+    st.global.f64 [%pd], %vc;
+$Ltanh_grad_f64_done:
+    ret;
+}
+
+// sum_f64: single-block 256-thread reduction with SMEM tree reduce.
+// Note: user regs must NOT be named %tid - conflict with special reg %tid.
+.visible .entry sum_f64(
+    .param .u64 p_a,
+    .param .u64 p_out,
+    .param .u32 p_n
+) {
+    .shared .align 8 .u64 sum_f64_sm[256];
+    .reg .u32 %tidx, %n, %i, %stride, %sh_base, %sh_addr, %partner_addr;
+    .reg .u64 %a, %out, %pa, %off_g;
+    .reg .f64 %v, %acc, %other;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.f64 %acc, 0d0000000000000000;
+    mov.u32 %i, %tidx;
+$Lsum_f64_loop:
+    setp.ge.u32 %p, %i, %n;
+    @%p bra $Lsum_f64_reduce;
+    mul.wide.u32 %off_g, %i, 8;
+    add.u64 %pa, %a, %off_g;
+    ld.global.f64 %v, [%pa];
+    add.f64 %acc, %acc, %v;
+    add.u32 %i, %i, 256;
+    bra $Lsum_f64_loop;
+$Lsum_f64_reduce:
+    mov.u32 %sh_base, sum_f64_sm;
+    shl.b32 %sh_addr, %tidx, 3;
+    add.u32 %sh_addr, %sh_addr, %sh_base;
+    st.shared.f64 [%sh_addr], %acc;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsum_f64_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsum_f64_end;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsum_f64_red_skip;
+    add.u32 %partner_addr, %tidx, %stride;
+    shl.b32 %partner_addr, %partner_addr, 3;
+    add.u32 %partner_addr, %partner_addr, %sh_base;
+    ld.shared.f64 %v, [%sh_addr];
+    ld.shared.f64 %other, [%partner_addr];
+    add.f64 %v, %v, %other;
+    st.shared.f64 [%sh_addr], %v;
+$Lsum_f64_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsum_f64_red_loop;
+$Lsum_f64_end:
+    setp.ne.u32 %p, %tidx, 0;
+    @%p bra $Lsum_f64_ret;
+    ld.shared.f64 %v, [%sh_base];
+    st.global.f64 [%out], %v;
+$Lsum_f64_ret:
+    ret;
+}
+
+// sum_f32: F32 IO but F64 accumulator inside kernel.
+.visible .entry sum_f32(
+    .param .u64 p_a,
+    .param .u64 p_out,
+    .param .u32 p_n
+) {
+    .shared .align 8 .u64 sum_f32_sm[256];
+    .reg .u32 %tidx, %n, %i, %stride, %sh_base, %sh_addr, %partner_addr;
+    .reg .u64 %a, %out, %pa, %off_g;
+    .reg .f32 %v32, %result32;
+    .reg .f64 %v, %acc, %other;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.f64 %acc, 0d0000000000000000;
+    mov.u32 %i, %tidx;
+$Lsum_f32_loop:
+    setp.ge.u32 %p, %i, %n;
+    @%p bra $Lsum_f32_reduce;
+    mul.wide.u32 %off_g, %i, 4;
+    add.u64 %pa, %a, %off_g;
+    ld.global.f32 %v32, [%pa];
+    cvt.f64.f32 %v, %v32;
+    add.f64 %acc, %acc, %v;
+    add.u32 %i, %i, 256;
+    bra $Lsum_f32_loop;
+$Lsum_f32_reduce:
+    mov.u32 %sh_base, sum_f32_sm;
+    shl.b32 %sh_addr, %tidx, 3;
+    add.u32 %sh_addr, %sh_addr, %sh_base;
+    st.shared.f64 [%sh_addr], %acc;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsum_f32_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsum_f32_end;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsum_f32_red_skip;
+    add.u32 %partner_addr, %tidx, %stride;
+    shl.b32 %partner_addr, %partner_addr, 3;
+    add.u32 %partner_addr, %partner_addr, %sh_base;
+    ld.shared.f64 %v, [%sh_addr];
+    ld.shared.f64 %other, [%partner_addr];
+    add.f64 %v, %v, %other;
+    st.shared.f64 [%sh_addr], %v;
+$Lsum_f32_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsum_f32_red_loop;
+$Lsum_f32_end:
+    setp.ne.u32 %p, %tidx, 0;
+    @%p bra $Lsum_f32_ret;
+    ld.shared.f64 %v, [%sh_base];
+    cvt.rn.f32.f64 %result32, %v;
+    st.global.f32 [%out], %result32;
+$Lsum_f32_ret:
+    ret;
+}
+
+// softmax_f64: 1 block per row, 256 threads. 3 phases: row_max, exp+sum, divide.
+// Inline fdlibm exp for numerical stability.
+.visible .entry softmax_f64(
+    .param .u64 p_a,
+    .param .u64 p_c,
+    .param .u32 p_rows,
+    .param .u32 p_cols
+) {
+    .shared .align 8 .u64 sm_max_f64[256];
+    .shared .align 8 .u64 sm_sum_f64[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems, %zero32, %expo;
+    .reg .u32 %max_base, %max_addr, %max_partner;
+    .reg .u32 %sum_base, %sum_addr, %sum_partner;
+    .reg .u64 %a, %c, %off, %pa, %pc, %row_off_bytes;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %v, %my_max, %row_max, %row_sum, %my_sum, %other, %xr;
+    .reg .f64 %invln2, %ln2H, %ln2L, %P1, %P2, %P3, %P4, %P5, %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %cpoly, %y, %twopk, %expv;
+    .reg .s32 %k_int, %expos;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %c, [p_c];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lsoftmax_f64_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 8;
+    add.u64 %pa, %a, %row_off_bytes;
+    add.u64 %pc, %c, %row_off_bytes;
+
+    mov.u32 %max_base, sm_max_f64;
+    mov.u32 %sum_base, sm_sum_f64;
+    shl.b32 %max_addr, %tidx, 3;
+    add.u32 %max_addr, %max_addr, %max_base;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+
+    // Phase 1: row max
+    mov.f64 %my_max, 0dFFF0000000000000;
+    mov.u32 %j, %tidx;
+$Lsm_f64_max_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsm_f64_max_reduce;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %pa, %pa, %off;
+    ld.global.f64 %v, [%pa];
+    max.f64 %my_max, %my_max, %v;
+    sub.u64 %pa, %pa, %off;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f64_max_loop;
+$Lsm_f64_max_reduce:
+    st.shared.f64 [%max_addr], %my_max;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsm_f64_max_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsm_f64_max_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsm_f64_max_red_skip;
+    add.u32 %max_partner, %tidx, %stride;
+    shl.b32 %max_partner, %max_partner, 3;
+    add.u32 %max_partner, %max_partner, %max_base;
+    ld.shared.f64 %v, [%max_addr];
+    ld.shared.f64 %other, [%max_partner];
+    max.f64 %v, %v, %other;
+    st.shared.f64 [%max_addr], %v;
+$Lsm_f64_max_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsm_f64_max_red_loop;
+$Lsm_f64_max_red_done:
+    ld.shared.f64 %row_max, [%max_base];
+    bar.sync 0;
+
+    // Phase 2: exp(x - row_max), write to c[j], sum accumulator
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mov.f64 %two,    0d4000000000000000;
+
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lsm_f64_exp_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsm_f64_sum_reduce;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %pa, %pa, %off;
+    ld.global.f64 %v, [%pa];
+    sub.u64 %pa, %pa, %off;
+    sub.f64 %xr, %v, %row_max;
+    // fdlibm exp(%xr) inline -> %expv
+    mul.f64 %k_fp, %xr, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %xr, %hi;
+    mul.f64 %lo, %k_fp, %ln2L;
+    sub.f64 %r, %hi, %lo;
+    mul.f64 %t, %r, %r;
+    mul.f64 %cpoly, %P5, %t;
+    add.f64 %cpoly, %cpoly, %P4;
+    mul.f64 %cpoly, %cpoly, %t;
+    add.f64 %cpoly, %cpoly, %P3;
+    mul.f64 %cpoly, %cpoly, %t;
+    add.f64 %cpoly, %cpoly, %P2;
+    mul.f64 %cpoly, %cpoly, %t;
+    add.f64 %cpoly, %cpoly, %P1;
+    mul.f64 %cpoly, %cpoly, %t;
+    sub.f64 %cpoly, %r, %cpoly;
+    sub.f64 %t, %two, %cpoly;
+    mul.f64 %r, %r, %cpoly;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+    add.s32 %expos, %k_int, 1023;
+    shl.b32 %expos, %expos, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expos};
+    mov.f64 %twopk, %twopk_bits;
+    mul.f64 %expv, %y, %twopk;
+    add.u64 %pc, %pc, %off;
+    st.global.f64 [%pc], %expv;
+    sub.u64 %pc, %pc, %off;
+    add.f64 %my_sum, %my_sum, %expv;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f64_exp_loop;
+$Lsm_f64_sum_reduce:
+    st.shared.f64 [%sum_addr], %my_sum;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsm_f64_sum_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsm_f64_sum_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsm_f64_sum_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %v, [%sum_addr];
+    ld.shared.f64 %other, [%sum_partner];
+    add.f64 %v, %v, %other;
+    st.shared.f64 [%sum_addr], %v;
+$Lsm_f64_sum_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsm_f64_sum_red_loop;
+$Lsm_f64_sum_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    bar.sync 0;
+
+    // Phase 3: divide c[j] /= row_sum
+    mov.u32 %j, %tidx;
+$Lsm_f64_div_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsoftmax_f64_end;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %pc, %pc, %off;
+    ld.global.f64 %v, [%pc];
+    div.rn.f64 %v, %v, %row_sum;
+    st.global.f64 [%pc], %v;
+    sub.u64 %pc, %pc, %off;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f64_div_loop;
+$Lsoftmax_f64_end:
+    ret;
+}
+
+// softmax_f32: same phases as softmax_f64, F32 IO + F64 sum accumulator.
+.visible .entry softmax_f32(
+    .param .u64 p_a,
+    .param .u64 p_c,
+    .param .u32 p_rows,
+    .param .u32 p_cols
+) {
+    .shared .align 4 .u32 sm_max_f32[256];
+    .shared .align 8 .u64 sm_sum_f32[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems;
+    .reg .u32 %max_base, %max_addr, %max_partner;
+    .reg .u32 %sum_base, %sum_addr, %sum_partner;
+    .reg .u64 %a, %c, %off, %pa, %pc, %row_off_bytes;
+    .reg .f32 %v32, %my_max, %row_max, %log2e, %t32, %e32, %xr, %inv_sum32;
+    .reg .f32 %other32;
+    .reg .f64 %my_sum, %row_sum, %e_wide, %other64, %sum_val;
+    .reg .pred %p;
+
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %c, [p_c];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lsoftmax_f32_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 4;
+    add.u64 %pa, %a, %row_off_bytes;
+    add.u64 %pc, %c, %row_off_bytes;
+
+    mov.u32 %max_base, sm_max_f32;
+    mov.u32 %sum_base, sm_sum_f32;
+    shl.b32 %max_addr, %tidx, 2;
+    add.u32 %max_addr, %max_addr, %max_base;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+
+    // Phase 1: row max
+    mov.f32 %my_max, 0fFF800000;
+    mov.u32 %j, %tidx;
+$Lsm_f32_max_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsm_f32_max_reduce;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %pa, %pa, %off;
+    ld.global.f32 %v32, [%pa];
+    max.f32 %my_max, %my_max, %v32;
+    sub.u64 %pa, %pa, %off;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f32_max_loop;
+$Lsm_f32_max_reduce:
+    st.shared.f32 [%max_addr], %my_max;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsm_f32_max_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsm_f32_max_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsm_f32_max_red_skip;
+    add.u32 %max_partner, %tidx, %stride;
+    shl.b32 %max_partner, %max_partner, 2;
+    add.u32 %max_partner, %max_partner, %max_base;
+    ld.shared.f32 %v32, [%max_addr];
+    ld.shared.f32 %other32, [%max_partner];
+    max.f32 %v32, %v32, %other32;
+    st.shared.f32 [%max_addr], %v32;
+$Lsm_f32_max_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsm_f32_max_red_loop;
+$Lsm_f32_max_red_done:
+    ld.shared.f32 %row_max, [%max_base];
+    bar.sync 0;
+
+    // Phase 2: exp via ex2.approx.f32, F64 sum accumulator
+    mov.f32 %log2e, 0f3FB8AA3B;
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lsm_f32_exp_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsm_f32_sum_reduce;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %pa, %pa, %off;
+    ld.global.f32 %v32, [%pa];
+    sub.u64 %pa, %pa, %off;
+    sub.f32 %xr, %v32, %row_max;
+    mul.f32 %t32, %xr, %log2e;
+    ex2.approx.f32 %e32, %t32;
+    add.u64 %pc, %pc, %off;
+    st.global.f32 [%pc], %e32;
+    sub.u64 %pc, %pc, %off;
+    cvt.f64.f32 %e_wide, %e32;
+    add.f64 %my_sum, %my_sum, %e_wide;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f32_exp_loop;
+$Lsm_f32_sum_reduce:
+    st.shared.f64 [%sum_addr], %my_sum;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lsm_f32_sum_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lsm_f32_sum_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lsm_f32_sum_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %sum_val, [%sum_addr];
+    ld.shared.f64 %other64, [%sum_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%sum_addr], %sum_val;
+$Lsm_f32_sum_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lsm_f32_sum_red_loop;
+$Lsm_f32_sum_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    bar.sync 0;
+    cvt.rn.f32.f64 %inv_sum32, %row_sum;
+    rcp.approx.f32 %inv_sum32, %inv_sum32;
+
+    // Phase 3: multiply by 1/row_sum
+    mov.u32 %j, %tidx;
+$Lsm_f32_div_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lsoftmax_f32_end;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %pc, %pc, %off;
+    ld.global.f32 %v32, [%pc];
+    mul.f32 %v32, %v32, %inv_sum32;
+    st.global.f32 [%pc], %v32;
+    sub.u64 %pc, %pc, %off;
+    add.u32 %j, %j, 256;
+    bra $Lsm_f32_div_loop;
+$Lsoftmax_f32_end:
+    ret;
+}
+`
+// END-OF-STAGE-5-DISABLED-BLOCK-BELOW
+var _ = `
+// ============================================================
+// relu_f32: c = max(a, 0)
+// ============================================================
+.visible .entry relu_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %zero;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mov.f32 %zero, 0f00000000;
+    max.f32 %vc, %va, %zero;
+    st.global.f32 [%pd], %vc;
+$Lrelu_f32_done:
+    ret;
+}
+
+// ============================================================
+// relu_f64
+// ============================================================
+.visible .entry relu_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f64 %va, %vc, %zero;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %va, [%pa];
+    mov.f64 %zero, 0d0000000000000000;
+    max.f64 %vc, %va, %zero;
+    st.global.f64 [%pd], %vc;
+$Lrelu_f64_done:
+    ret;
+}
+
+// ============================================================
+// sigmoid_f32: c = 1 / (1 + exp(-x))  via ex2.approx.f32
+// ============================================================
+.visible .entry sigmoid_f32(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .f32 %va, %vc, %log2e, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %va, [%pa];
+    mov.f32 %log2e, 0f3FB8AA3B;
+    mov.f32 %one,   0f3F800000;
+    neg.f32 %t, %va;
+    mul.f32 %t, %t, %log2e;
+    ex2.approx.f32 %t, %t;
+    add.f32 %t, %t, %one;
+    rcp.approx.f32 %vc, %t;
+    st.global.f32 [%pd], %vc;
+$Lsigmoid_f32_done:
+    ret;
+}
+
+// ============================================================
+// sigmoid_f64: c = 1 / (1 + exp(-x)) - exp(-x) inline fdlibm
+// ============================================================
+.visible .entry sigmoid_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %zero32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %x, %negx, %invln2, %ln2H, %ln2L;
+    .reg .f64 %P1, %P2, %P3, %P4, %P5, %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %c, %y, %twopk, %expmx, %result;
+    .reg .s32 %k_int, %expo;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+    neg.f64 %negx, %x;
+    // Inline fdlibm exp(negx) -> %expmx
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mov.f64 %two,    0d4000000000000000;
+    mul.f64 %k_fp, %negx, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %negx, %hi;
+    mul.f64 %lo, %k_fp, %ln2L;
+    sub.f64 %r, %hi, %lo;
+    mul.f64 %t, %r, %r;
+    mul.f64 %c, %P5, %t;
+    add.f64 %c, %c, %P4;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P3;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P2;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P1;
+    mul.f64 %c, %c, %t;
+    sub.f64 %c, %r, %c;
+    sub.f64 %t, %two, %c;
+    mul.f64 %r, %r, %c;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+    add.s32 %expo, %k_int, 1023;
+    shl.b32 %expo, %expo, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expo};
+    mov.f64 %twopk, %twopk_bits;
+    mul.f64 %expmx, %y, %twopk;
+    // sigmoid = 1 / (1 + exp(-x))
+    add.f64 %t, %expmx, %one;
+    div.rn.f64 %result, %one, %t;
+    st.global.f64 [%pd], %result;
+$Lsigmoid_f64_done:
+    ret;
+}
+
+// tanh_f32: hardware tanh.approx.f32 (PTX 7.0+, sm_75+).
+
+// ============================================================
+// tanh_f64: c = (exp(2x) - 1) / (exp(2x) + 1) via inline fdlibm exp
+// ============================================================
+.visible .entry tanh_f64(
+    .param .u64 p_a,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n, %zero32;
+    .reg .u64 %a, %dst, %off, %pa, %pd;
+    .reg .b64 %twopk_bits;
+    .reg .f64 %x, %twox, %invln2, %ln2H, %ln2L;
+    .reg .f64 %P1, %P2, %P3, %P4, %P5, %one, %two;
+    .reg .f64 %k_fp, %hi, %lo, %r, %t, %c, %y, %twopk, %e2x, %num, %denom, %result;
+    .reg .s32 %k_int, %expo;
+    .reg .pred %p;
+    ld.param.u64 %a, [p_a];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %pa, %a, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %x, [%pa];
+    mov.f64 %two, 0d4000000000000000;
+    mul.f64 %twox, %x, %two;
+    // Inline fdlibm exp(twox) -> %e2x
+    mov.f64 %invln2, 0d3FF71547652B82FE;
+    mov.f64 %ln2H,   0d3FE62E42FEE00000;
+    mov.f64 %ln2L,   0d3DEA39EF35793C76;
+    mov.f64 %P1,     0d3FC555555555553E;
+    mov.f64 %P2,     0dBF66C16C16BEBD93;
+    mov.f64 %P3,     0d3F11566AAF25DE2C;
+    mov.f64 %P4,     0dBEBBBD41C5D26BF1;
+    mov.f64 %P5,     0d3E66376972BEA4D0;
+    mov.f64 %one,    0d3FF0000000000000;
+    mul.f64 %k_fp, %twox, %invln2;
+    cvt.rni.s32.f64 %k_int, %k_fp;
+    cvt.rn.f64.s32 %k_fp, %k_int;
+    mul.f64 %hi, %k_fp, %ln2H;
+    sub.f64 %hi, %twox, %hi;
+    mul.f64 %lo, %k_fp, %ln2L;
+    sub.f64 %r, %hi, %lo;
+    mul.f64 %t, %r, %r;
+    mul.f64 %c, %P5, %t;
+    add.f64 %c, %c, %P4;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P3;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P2;
+    mul.f64 %c, %c, %t;
+    add.f64 %c, %c, %P1;
+    mul.f64 %c, %c, %t;
+    sub.f64 %c, %r, %c;
+    sub.f64 %t, %two, %c;
+    mul.f64 %r, %r, %c;
+    div.rn.f64 %r, %r, %t;
+    sub.f64 %t, %lo, %r;
+    sub.f64 %t, %t, %hi;
+    sub.f64 %y, %one, %t;
+    add.s32 %expo, %k_int, 1023;
+    shl.b32 %expo, %expo, 20;
+    mov.u32 %zero32, 0;
+    mov.b64 %twopk_bits, {%zero32, %expo};
+    mov.f64 %twopk, %twopk_bits;
+    mul.f64 %e2x, %y, %twopk;
+    // tanh = (e2x - 1) / (e2x + 1)
+    sub.f64 %num, %e2x, %one;
+    add.f64 %denom, %e2x, %one;
+    div.rn.f64 %result, %num, %denom;
+    st.global.f64 [%pd], %result;
+$Ltanh_f64_done:
+    ret;
+}
+
+// ============================================================
+// relu_grad_f32: dX = (X > 0) ? dY : 0
+// Args (via launchElementwise3): input=X, grad=dY, out=dX
+// ============================================================
+.visible .entry relu_grad_f32(
+    .param .u64 p_x,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %x, %dy, %dst, %off, %px, %pdy, %pd;
+    .reg .f32 %vx, %vdy, %vc, %zero;
+    .reg .pred %pmask, %p;
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %px, %x, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vx, [%px];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %zero, 0f00000000;
+    setp.gt.f32 %pmask, %vx, %zero;
+    selp.f32 %vc, %vdy, %zero, %pmask;
+    st.global.f32 [%pd], %vc;
+$Lrelu_grad_f32_done:
+    ret;
+}
+
+// ============================================================
+// relu_grad_f64
+// ============================================================
+.visible .entry relu_grad_f64(
+    .param .u64 p_x,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %x, %dy, %dst, %off, %px, %pdy, %pd;
+    .reg .f64 %vx, %vdy, %vc, %zero;
+    .reg .pred %pmask, %p;
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lrelu_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %px, %x, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vx, [%px];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %zero, 0d0000000000000000;
+    setp.gt.f64 %pmask, %vx, %zero;
+    selp.f64 %vc, %vdy, %zero, %pmask;
+    st.global.f64 [%pd], %vc;
+$Lrelu_grad_f64_done:
+    ret;
+}
+
+// ============================================================
+// sigmoid_grad_f32: dX = dY * Y * (1 - Y)
+// Args: sigOut=Y, grad=dY, out=dX
+// ============================================================
+.visible .entry sigmoid_grad_f32(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f32 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vy, [%py];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %one, 0f3F800000;
+    sub.f32 %t, %one, %vy;
+    mul.f32 %t, %t, %vy;
+    mul.f32 %vc, %vdy, %t;
+    st.global.f32 [%pd], %vc;
+$Lsigmoid_grad_f32_done:
+    ret;
+}
+
+// ============================================================
+// sigmoid_grad_f64
+// ============================================================
+.visible .entry sigmoid_grad_f64(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f64 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Lsigmoid_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vy, [%py];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %one, 0d3FF0000000000000;
+    sub.f64 %t, %one, %vy;
+    mul.f64 %t, %t, %vy;
+    mul.f64 %vc, %vdy, %t;
+    st.global.f64 [%pd], %vc;
+$Lsigmoid_grad_f64_done:
+    ret;
+}
+
+// ============================================================
+// tanh_grad_f32: dX = dY * (1 - Y^2)
+// Args: tanhOut=Y, grad=dY, out=dX
+// ============================================================
+.visible .entry tanh_grad_f32(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f32 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_grad_f32_done;
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f32 %vy, [%py];
+    ld.global.f32 %vdy, [%pdy];
+    mov.f32 %one, 0f3F800000;
+    mul.f32 %t, %vy, %vy;
+    sub.f32 %t, %one, %t;
+    mul.f32 %vc, %vdy, %t;
+    st.global.f32 [%pd], %vc;
+$Ltanh_grad_f32_done:
+    ret;
+}
+
+// ============================================================
+// tanh_grad_f64
+// ============================================================
+.visible .entry tanh_grad_f64(
+    .param .u64 p_y,
+    .param .u64 p_dy,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %idx, %n;
+    .reg .u64 %y, %dy, %dst, %off, %py, %pdy, %pd;
+    .reg .f64 %vy, %vdy, %vc, %one, %t;
+    .reg .pred %p;
+    ld.param.u64 %y, [p_y];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $Ltanh_grad_f64_done;
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %py, %y, %off;
+    add.u64 %pdy, %dy, %off;
+    add.u64 %pd, %dst, %off;
+    ld.global.f64 %vy, [%py];
+    ld.global.f64 %vdy, [%pdy];
+    mov.f64 %one, 0d3FF0000000000000;
+    mul.f64 %t, %vy, %vy;
+    sub.f64 %t, %one, %t;
+    mul.f64 %vc, %vdy, %t;
+    st.global.f64 [%pd], %vc;
+$Ltanh_grad_f64_done:
+    ret;
+}
+*/
+`
