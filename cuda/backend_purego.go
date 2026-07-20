@@ -21,6 +21,7 @@ type PuregoBackend struct {
 	cublas     uintptr            // cublasHandle_t (Этап 2)
 	ptxModule  uintptr            // CUmodule с r02bKernelsPTX (Этап 3)
 	fns        map[string]uintptr // CUfunction cache: name → handle (Этап 3+)
+	stream     uintptr            // CUstream для kernel launch (R03b-impl-2, default 0 = default stream)
 }
 
 // Assertion: *PuregoBackend удовлетворяет Backend.
@@ -194,7 +195,7 @@ func (b *PuregoBackend) launchElementwise3(fnName string, a, bb, c DeviceBuffer,
 		unsafe.Pointer(&args.n),
 	}
 	grid, block := launchGrid(n)
-	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, 0,
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
 		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
 	}
@@ -226,7 +227,7 @@ func (b *PuregoBackend) launchElementwise2(fnName string, a, c DeviceBuffer, n i
 		unsafe.Pointer(&args.n),
 	}
 	grid, block := launchGrid(n)
-	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, 0,
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
 		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
 	}
@@ -261,7 +262,7 @@ func (b *PuregoBackend) launchScalarF64(fnName string, a DeviceBuffer, scalar fl
 		unsafe.Pointer(&args.n),
 	}
 	grid, block := launchGrid(n)
-	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, 0,
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
 		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
 	}
@@ -297,7 +298,7 @@ func (b *PuregoBackend) launchScalarF32(fnName string, a DeviceBuffer, scalar fl
 		unsafe.Pointer(&args.n),
 	}
 	grid, block := launchGrid(n)
-	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, 0,
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
 		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
 	}
@@ -331,6 +332,36 @@ func (b *PuregoBackend) Sync() error {
 	}
 	defer runtime.UnlockOSThread()
 	return check(cuCtxSynchronize(), "cuCtxSynchronize")
+}
+
+// SetStream — hook инъекции CUDA-stream для интеграции с внешним владельцем
+// stream'а (goml adapter, R03b-impl-2).
+//
+// Формально: сохраняет stream в приватное поле и перепривязывает cuBLAS handle
+// на этот stream. Все последующие kernel launch (cuLaunchKernel) и cublasSgemm
+// пойдут в указанный stream, а не в default. По умолчанию (без вызова
+// SetStream) b.stream == 0 = default stream — старое поведение сохранено
+// байт-в-байт.
+//
+// Использовать ТОЛЬКО при интеграции с миром, у которого свой stream (goml
+// adapter при инициализации отдаёт свой cuStreamCreate'нутый stream). НЕ
+// расширение публичного API «StreamBackend» из R02a — это single-purpose hook
+// инициализации, не универсальный per-call stream-параметр.
+//
+// Аргумент — unsafe.Pointer чтобы избежать exposure uintptr в публичной
+// сигнатуре (R02b-fix правило дверей). Реинтерпретация через тот же
+// reinterpret-cast что UnsafeExtractDevicePtr.
+func (b *PuregoBackend) SetStream(s unsafe.Pointer) error {
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	// unsafe.Pointer → uintptr (handle из CUDA driver, не Go-heap).
+	b.stream = *(*uintptr)(unsafe.Pointer(&s))
+	if s := cublasSetStream_v2(b.cublas, b.stream); s != CUBLAS_STATUS_SUCCESS {
+		return fmt.Errorf("cublasSetStream_v2(injected): %s", s.Error())
+	}
+	return nil
 }
 
 func (b *PuregoBackend) Close() error {
@@ -676,7 +707,7 @@ func (b *PuregoBackend) launchReduce1(fnName string, a DeviceBuffer, outPtr uint
 	if r := cuLaunchKernel(fn,
 		1, 1, 1,
 		256, 1, 1,
-		0, 0,
+		0, b.stream,
 		unsafe.Pointer(&params[0]),
 		nil,
 	); r != CUDA_SUCCESS {
@@ -707,7 +738,7 @@ func (b *PuregoBackend) launchSoftmax(fnName string, a, c DeviceBuffer, rows, co
 	if r := cuLaunchKernel(fn,
 		uint32(rows), 1, 1,
 		256, 1, 1,
-		0, 0,
+		0, b.stream,
 		unsafe.Pointer(&params[0]),
 		nil,
 	); r != CUDA_SUCCESS {
