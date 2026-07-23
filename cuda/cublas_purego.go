@@ -97,6 +97,23 @@ var (
 	) cublasStatus
 )
 
+// B-impl-1 Step 1 probe (FIXED FACT):
+//   purego v0.9.1 паникует "too many arguments" при регистрации функций с
+//   >=18 аргументами. Проверено экспериментально:
+//     cublasSgemmStridedBatched (18 args) -- panic at RegisterLibFunc.
+//     cublasGemmEx (19 args) -- то же.
+//   Это подтверждает прецедент goml: `libs1/cublas_wrapper.c` использует
+//   struct-args wrappers `gemmex_wrapper` / `gemm_strided_batched_ex_wrapper`
+//   с 1-pointer entry именно из-за этого лимита.
+//
+// Решение B-impl-1: batched F32/F64 реализован через ЦИКЛ cublasSgemm_v2 /
+//   cublasDgemm_v2 (14 args, работает). Это тот же паттерн что goml
+//   `BatchedMatMulF32` (`goml/backend/cuda/cublas.go:264`) -- loop by batch.
+//   Loop-batched < strided-batched на big-batch (kernel launch overhead), но:
+//     (а) даёт bit-exact vs goml на A/B тестах (один и тот же алгоритм);
+//     (б) для gputrain-shape batch=1 разницы нет;
+//     (в) настоящий strided-batched через wrapper.so -- отдельный ТЗ.
+
 // initCuBLAS загружает libcublas.so.12 и регистрирует биндинги. Идемпотентна.
 func initCuBLAS() error {
 	cublasOnce.Do(func() {
@@ -115,6 +132,8 @@ func initCuBLAS() error {
 		purego.RegisterLibFunc(&cublasSetMathMode, lib, "cublasSetMathMode")
 		purego.RegisterLibFunc(&cublasDgemm_v2, lib, "cublasDgemm_v2")
 		purego.RegisterLibFunc(&cublasSgemm_v2, lib, "cublasSgemm_v2")
+		// B-impl-1: strided batched НЕ регистрируем -- purego v0.9.1 упирается
+		// на >=18 args (проверено). Batched через loop cublasSgemm_v2. См. комментарий выше.
 	})
 	return cublasErr
 }

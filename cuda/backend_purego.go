@@ -1586,3 +1586,78 @@ func (b *PuregoBackend) MatMulF32_TF32(a, bb, c DeviceBuffer, m, n, k int) error
 	}
 	return nil
 }
+
+// ──────────────────────────────────────────────────────────
+// B-impl-1: strided batched F32/F64 через loop.
+// purego v0.9.1 упирается на >=18 args в native cublasSgemmStridedBatched
+// (проверено экспериментально в Step 1). Loop-паттерн совпадает с goml
+// BatchedMatMulF32 (`goml/backend/cuda/cublas.go:264`) -- даёт bit-exact
+// vs goml на A/B тестах при одном math mode.
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) MatMulStridedBatchedF32(a, bb, c DeviceBuffer,
+	batch, m, n, k int,
+	strideA, strideB, strideC int64) error {
+	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF32: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	// Страйды -- в элементах; в байтах для указателя = stride * sizeof(f32) = *4.
+	sA := uintptr(strideA) * 4
+	sB := uintptr(strideB) * 4
+	sC := uintptr(strideC) * 4
+	for i := 0; i < batch; i++ {
+		s := cublasSgemm_v2(
+			b.cublas,
+			CUBLAS_OP_N, CUBLAS_OP_N,
+			int32(n), int32(m), int32(k),
+			unsafe.Pointer(&alpha),
+			vb.ptr+sB*uintptr(i), int32(n),
+			va.ptr+sA*uintptr(i), int32(k),
+			unsafe.Pointer(&beta),
+			vc.ptr+sC*uintptr(i), int32(n),
+		)
+		if s != CUBLAS_STATUS_SUCCESS {
+			return fmt.Errorf("cublasSgemm_v2 batch=%d/%d: %s", i, batch, s.Error())
+		}
+	}
+	return nil
+}
+
+func (b *PuregoBackend) MatMulStridedBatchedF64(a, bb, c DeviceBuffer,
+	batch, m, n, k int,
+	strideA, strideB, strideC int64) error {
+	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF64: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float64(1.0), float64(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	sA := uintptr(strideA) * 8
+	sB := uintptr(strideB) * 8
+	sC := uintptr(strideC) * 8
+	for i := 0; i < batch; i++ {
+		s := cublasDgemm_v2(
+			b.cublas,
+			CUBLAS_OP_N, CUBLAS_OP_N,
+			int32(n), int32(m), int32(k),
+			unsafe.Pointer(&alpha),
+			vb.ptr+sB*uintptr(i), int32(n),
+			va.ptr+sA*uintptr(i), int32(k),
+			unsafe.Pointer(&beta),
+			vc.ptr+sC*uintptr(i), int32(n),
+		)
+		if s != CUBLAS_STATUS_SUCCESS {
+			return fmt.Errorf("cublasDgemm_v2 batch=%d/%d: %s", i, batch, s.Error())
+		}
+	}
+	return nil
+}

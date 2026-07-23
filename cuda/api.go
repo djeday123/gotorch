@@ -273,6 +273,19 @@ type Backend interface {
 	// TF32 использует 10-bit mantissa в FMA. Назначение: сверка с legacy-путями,
 	// у которых cublas handle глобально в TF32. См. R03b_design.md impl-4-final.
 	MatMulF32_TF32(a, b, c DeviceBuffer, m, n, k int) error
+
+	// --- Batched MatMul (B-impl-1) ---
+	//
+	// A[batch, M, K] × B[batch, K, N] = C[batch, M, N] с явным strided layout.
+	// Страйды -- в **элементах**, не байтах.
+	// Реализация: цикл cublasSgemm_v2/Dgemm_v2 по батчу (purego v0.9.1
+	// упирается на >=18 args в cublasSgemmStridedBatched -- см. cublas_purego.go).
+	// Совпадает с goml `BatchedMatMulF32` (loop-паттерн), даёт bit-exact vs goml.
+	// F64 -- судейский путь.
+	MatMulStridedBatchedF32(a, b, c DeviceBuffer, batch, m, n, k int,
+		strideA, strideB, strideC int64) error
+	MatMulStridedBatchedF64(a, b, c DeviceBuffer, batch, m, n, k int,
+		strideA, strideB, strideC int64) error
 }
 
 // NewBackend возвращает purego-backend, привязанный к устройству device.
