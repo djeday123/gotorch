@@ -154,6 +154,8 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		"rope_f64", "rope_grad_f64",
 		// P5A-EMB-I64: int64->int32 index conversion (для I64-фасада Embedding)
 		"cvt_u64_to_u32",
+		// B-impl-2: F32<->F16 конверсии.
+		"cvt_f32_to_f16", "cvt_f16_to_f32",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -1718,4 +1720,128 @@ func (b *PuregoBackend) MatMulStridedBatchedF64(a, bb, c DeviceBuffer,
 		return nil
 	}
 	return b.matMulBatchedF64Loop(a, bb, c, batch, m, n, k, strideA, strideB, strideC)
+}
+
+// ──────────────────────────────────────────────────────────
+// B-impl-2: F16 mixed precision через wrapper .so (gt_gemm_ex).
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) MatMulF16(a, bb, c DeviceBuffer, m, n, k int) error {
+	if m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulF16: m/n/k must be > 0")
+	}
+	if !HasBlasWrapper() {
+		return fmt.Errorf("cuda.MatMulF16: libgotorch_blas_wrapper.so required (cublasGemmEx имеет 19 args, purego не может)")
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	args := GemmExArgs{
+		Stream: b.stream,
+		TransA: int32(CUBLAS_OP_N), TransB: int32(CUBLAS_OP_N),
+		M:      int32(n), N: int32(m), K: int32(k),
+		Alpha:       unsafe.Pointer(&alpha),
+		A:           vb.ptr, AType: CUDA_R_16F, Lda: int32(n),
+		B:           va.ptr, BType: CUDA_R_16F, Ldb: int32(k),
+		Beta:        unsafe.Pointer(&beta),
+		C:           vc.ptr, CType: CUDA_R_32F, Ldc: int32(n),
+		ComputeType: CUBLAS_COMPUTE_32F_FAST_TF32,
+		Algo:        CUBLAS_GEMM_DEFAULT,
+	}
+	st := gtGemmEx(unsafe.Pointer(&args))
+	if st != int32(CUBLAS_STATUS_SUCCESS) {
+		return fmt.Errorf("gt_gemm_ex(F16): %s", cublasStatus(st).Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) MatMulStridedBatchedF16(a, bb, c DeviceBuffer,
+	batch, m, n, k int, strideA, strideB, strideC int64) error {
+	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF16: dims must be > 0")
+	}
+	if !HasBlasWrapper() {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF16: libgotorch_blas_wrapper.so required")
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	args := GemmStridedBatchedExArgs{
+		Stream: b.stream,
+		TransA: int32(CUBLAS_OP_N), TransB: int32(CUBLAS_OP_N),
+		M:      int32(n), N: int32(m), K: int32(k),
+		Alpha:       unsafe.Pointer(&alpha),
+		A:           vb.ptr, AType: CUDA_R_16F, Lda: int32(n), StrideA: strideB,
+		B:           va.ptr, BType: CUDA_R_16F, Ldb: int32(k), StrideB: strideA,
+		Beta:        unsafe.Pointer(&beta),
+		C:           vc.ptr, CType: CUDA_R_32F, Ldc: int32(n), StrideC: strideC,
+		Batch:       int32(batch),
+		ComputeType: CUBLAS_COMPUTE_32F_FAST_TF32,
+		Algo:        CUBLAS_GEMM_DEFAULT,
+	}
+	st := gtGemmStridedBatchedEx(unsafe.Pointer(&args))
+	if st != int32(CUBLAS_STATUS_SUCCESS) {
+		return fmt.Errorf("gt_gemm_strided_batched_ex(F16): %s", cublasStatus(st).Error())
+	}
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────
+// F32 <-> F16 конверсии (util для F16 workflow).
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) launchCvtF32F16(fnName string, srcPtr, dstPtr uintptr, n int) error {
+	fn, err := b.getKernel(fnName)
+	if err != nil {
+		return err
+	}
+	args := struct {
+		src uintptr
+		dst uintptr
+		n   int32
+		_   int32
+	}{srcPtr, dstPtr, int32(n), 0}
+	params := [3]unsafe.Pointer{
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.n),
+	}
+	grid, block := launchGrid(n)
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) CastF32ToF16(src, dst DeviceBuffer, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("cuda.CastF32ToF16: n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
+	return b.launchCvtF32F16("cvt_f32_to_f16", vs.ptr, vd.ptr, n)
+}
+
+func (b *PuregoBackend) CastF16ToF32(src, dst DeviceBuffer, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("cuda.CastF16ToF32: n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
+	return b.launchCvtF32F16("cvt_f16_to_f32", vs.ptr, vd.ptr, n)
 }

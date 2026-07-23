@@ -2723,6 +2723,77 @@ $L_rope_f64_done:
 $L_rope_grad_f64_done:
     ret;
 }
+
+// ================================================================
+// B-impl-2: F32 <-> F16 conversion kernels for FP16 mixed precision.
+// F16 = IEEE 754 binary16, stored as uint16 little-endian in DeviceBuffer.
+// PTX cvt.rn.f16.f32 (F32 -> F16 round-nearest), cvt.f32.f16 (widening).
+// ================================================================
+.visible .entry cvt_f32_to_f16(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %n, %idx;
+    .reg .u64 %src, %dst, %addr, %off;
+    .reg .f32 %v32;
+    .reg .b16 %v16;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $L_cvt_f32_f16_end;
+
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v32, [%addr];
+    cvt.rn.f16.f32 %v16, %v32;
+
+    mul.wide.u32 %off, %idx, 2;
+    add.u64 %addr, %dst, %off;
+    st.global.b16 [%addr], %v16;
+$L_cvt_f32_f16_end:
+    ret;
+}
+
+.visible .entry cvt_f16_to_f32(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %n, %idx;
+    .reg .u64 %src, %dst, %addr, %off;
+    .reg .f32 %v32;
+    .reg .b16 %v16;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $L_cvt_f16_f32_end;
+
+    mul.wide.u32 %off, %idx, 2;
+    add.u64 %addr, %src, %off;
+    ld.global.b16 %v16, [%addr];
+    cvt.f32.f16 %v32, %v16;
+
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %addr, %dst, %off;
+    st.global.f32 [%addr], %v32;
+$L_cvt_f16_f32_end:
+    ret;
+}
 `
 // END-OF-STAGE-5-DISABLED-BLOCK-BELOW
 var _ = `

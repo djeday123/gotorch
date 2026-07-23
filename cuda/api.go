@@ -286,6 +286,28 @@ type Backend interface {
 		strideA, strideB, strideC int64) error
 	MatMulStridedBatchedF64(a, b, c DeviceBuffer, batch, m, n, k int,
 		strideA, strideB, strideC int64) error
+
+	// --- F16 mixed precision (B-impl-2) ---
+	//
+	// A, B -- FP16 IEEE binary16 (uint16 buffers, little-endian).
+	// C -- FP32 accumulator (float32 buffer).
+	// Compute: CUBLAS_COMPUTE_32F_FAST_TF32 (F32 accum via TF32 tensor cores).
+	// Требует libgotorch_blas_wrapper.so (cublasGemmEx имеет 19 args, purego bad).
+	// При отсутствии .so -- error ("wrapper required for F16"), fallback не имеет смысла
+	// (single Sgemm-loop не даёт F16 вообще).
+	//
+	// Contract: aBytes/bBytes = m*k*2/k*n*2; cBytes = m*n*4.
+	// Doc: half-буфер -- свойство метода, DeviceBuffer нейтрален.
+	MatMulF16(a, b, c DeviceBuffer, m, n, k int) error
+	MatMulStridedBatchedF16(a, b, c DeviceBuffer, batch, m, n, k int,
+		strideA, strideB, strideC int64) error
+
+	// --- F32 <-> F16 конверсии (B-impl-2 support) ---
+	//
+	// PTX ядра cvt.rn.f16.f32 / cvt.f32.f16. Тривиальные поэлементные.
+	// Для quantize/dequantize workflow вокруг MatMulF16.
+	CastF32ToF16(src, dst DeviceBuffer, n int) error
+	CastF16ToF32(src, dst DeviceBuffer, n int) error
 }
 
 // NewBackend возвращает purego-backend, привязанный к устройству device.
