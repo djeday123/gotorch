@@ -299,24 +299,30 @@ static int lt_setup(Fp8E4M3MatmulArgs *a) {
     cublasLtMatrixLayoutCreate(&s_lt_B, CUDA_R_8F_E4M3, K, M, K);
     cublasLtMatrixLayoutCreate(&s_lt_C, CUDA_R_16F, N, M, N);
 
-    // Try compute types in preferred order (по прецеденту goml libs1).
+    // Try compute types in preferred order. v3 goml prior art shows COMPUTE_16F
+    // + scale=R_16F works on sm_89; для sm_120a пробуем сначала так же.
     cublasComputeType_t tryCompute[] = {
+        CUBLAS_COMPUTE_16F,           // v3 goml successful path
         CUBLAS_COMPUTE_32F_FAST_16F,
         CUBLAS_COMPUTE_32F_FAST_TF32,
         CUBLAS_COMPUTE_32F,
     };
-    const char *tryNames[] = {"FAST_16F", "FAST_TF32", "32F"};
+    cudaDataType_t tryScale[] = {
+        CUDA_R_16F,                    // matches CUBLAS_COMPUTE_16F
+        CUDA_R_32F, CUDA_R_32F, CUDA_R_32F,
+    };
+    const char *tryNames[] = {"COMPUTE_16F+R_16F", "FAST_16F", "FAST_TF32", "32F"};
     cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
     cublasLtMatmulHeuristicResult_t heur[16];
     int found = 0;
     int chosenIdx = -1;
 
-    for (int ci = 0; ci < 3; ci++) {
+    for (int ci = 0; ci < 4; ci++) {
         if (s_lt_desc) {
             cublasLtMatmulDescDestroy(s_lt_desc);
             s_lt_desc = NULL;
         }
-        st = cublasLtMatmulDescCreate(&s_lt_desc, tryCompute[ci], CUDA_R_32F);
+        st = cublasLtMatmulDescCreate(&s_lt_desc, tryCompute[ci], tryScale[ci]);
         if (st != CUBLAS_STATUS_SUCCESS) continue;
 
         cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
@@ -324,7 +330,8 @@ static int lt_setup(Fp8E4M3MatmulArgs *a) {
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a->scaleA, sizeof(a->scaleA));
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &a->scaleB, sizeof(a->scaleB));
-        cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &a->scaleC, sizeof(a->scaleC));
+        // NB: D_SCALE_POINTER NOT set for FP16 output path (v3 goml precedent).
+        // Setting it triggers cublasLt to expect FP8 output which our C = FP16 layout is not.
         int8_t fastAccum = 1;
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum, sizeof(fastAccum));
 
@@ -375,10 +382,9 @@ int32_t gt_lt_matmul_fp8_e4m3(Fp8E4M3MatmulArgs *a) {
         rc = lt_setup(a);
         if (rc) return rc;
     } else {
-        // Update scale pointers on cached desc (they may change between calls).
+        // Update A/B scale pointers on cached desc (D_SCALE not set for FP16 output).
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a->scaleA, sizeof(a->scaleA));
         cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &a->scaleB, sizeof(a->scaleB));
-        cublasLtMatmulDescSetAttribute(s_lt_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER, &a->scaleC, sizeof(a->scaleC));
     }
     // amaxD is optional -- set/unset per call.
     if (a->amaxD) {
