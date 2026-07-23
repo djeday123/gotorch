@@ -308,6 +308,31 @@ type Backend interface {
 	// Для quantize/dequantize workflow вокруг MatMulF16.
 	CastF32ToF16(src, dst DeviceBuffer, n int) error
 	CastF16ToF32(src, dst DeviceBuffer, n int) error
+
+	// --- FP8 E4M3 (B-impl-3) ---
+	//
+	// A, B -- FP8 E4M3 (uint8 buffers). C -- FP32 output.
+	// scaleA, scaleB, scaleC -- device float* per-tensor scales.
+	// scaleC обычно 1.0 если dequantize-in-kernel не нужен (D output = сырой FP32).
+	// amaxD -- optional device float*: если non-nil, cuBLASLt пишет absmax(D) сюда
+	// (для post-hoc quantize следующего шага). nil = не отслеживаем.
+	//
+	// Требует libgotorch_blas_wrapper.so (cublasLtMatmul через local Lt-handle).
+	// При отсутствии .so -- error ("wrapper required for FP8").
+	//
+	// Class floor (paper B4): abs 5e-3 + rel 5e-3.
+	MatMulF8E4M3(a, b, c, scaleA, scaleB, scaleC, amaxD DeviceBuffer, m, n, k int) error
+
+	// --- FP8 support: quantize F32 -> F8E4M3 с amax + scale ---
+	//
+	// Fused kernel: reduce absmax(src) -> compute scale = amax/E4M3_MAX -> cast src/scale -> dst.
+	// scale, amax -- device float* single-element buffers (переиспользуемые в MatMulF8E4M3).
+	// PTX ядро с SMEM tree-reduction для amax, F32->F8E4M3 cvt.
+	QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error
+
+	// CastF8E4M3ToF32 -- широкая конверсия обратно (dequantize).
+	// Учитывает scale device float*: dst[i] = f8_to_f32(src[i]) * scale[0].
+	CastF8E4M3ToF32(src, dst, scale DeviceBuffer, n int) error
 }
 
 // NewBackend возвращает purego-backend, привязанный к устройству device.

@@ -19,7 +19,7 @@ SRC        = blas_wrapper.c
 
 CFLAGS   = -O2 -fPIC -Wall
 INCLUDES = -I$(CUDA_HOME)/include
-LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcublas
+LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcublas -lcublasLt -lcudart
 
 .PHONY: all clean check
 

@@ -122,12 +122,31 @@ type GemmStridedBatchedExArgs struct {
 
 // cudaDataType (subset used here).
 const (
-	CUDA_R_16F int32 = 2  // half
-	CUDA_R_32F int32 = 0  // float
-	CUDA_R_64F int32 = 1  // double
-	CUDA_R_16BF int32 = 14 // bfloat16
+	CUDA_R_16F     int32 = 2  // half
+	CUDA_R_32F     int32 = 0  // float
+	CUDA_R_64F     int32 = 1  // double
+	CUDA_R_16BF    int32 = 14 // bfloat16
 	CUDA_R_8F_E4M3 int32 = 28 // FP8 E4M3 (Ada+/Hopper+)
+	CUDA_R_8F_E5M2 int32 = 29 // FP8 E5M2
 )
+
+// B-impl-3: FP8 E4M3 args -- cublasLtMatmul via wrapper (local Lt handle).
+type Fp8E4M3MatmulArgs struct {
+	Stream uintptr        // CUstream
+	M      int32
+	N      int32
+	K      int32
+	_pad   int32          // align next uintptr on 8-byte (matches C _pad)
+	A      uintptr        // FP8 E4M3 device ptr
+	B      uintptr        // FP8 E4M3 device ptr
+	C      uintptr        // FP32 device ptr
+	Alpha  unsafe.Pointer // host float32*
+	Beta   unsafe.Pointer // host float32*
+	ScaleA uintptr        // device float* (per-tensor)
+	ScaleB uintptr        // device float*
+	ScaleC uintptr        // device float* (output pre-quant, обычно 1.0)
+	AmaxD  uintptr        // device float* (optional, 0 = не устанавливать)
+}
 
 // cublasComputeType_t (subset).
 const (
@@ -150,6 +169,7 @@ var (
 	gtDgemmStridedBatched   func(args unsafe.Pointer) int32
 	gtGemmEx                func(args unsafe.Pointer) int32
 	gtGemmStridedBatchedEx  func(args unsafe.Pointer) int32
+	gtLtMatmulFp8E4M3       func(args unsafe.Pointer) int32
 )
 
 // resolveBlasWrapperPath ищет libgotorch_blas_wrapper.so в 3 местах.
@@ -193,6 +213,7 @@ func initBlasWrapper() {
 		purego.RegisterLibFunc(&gtDgemmStridedBatched, lib, "gt_dgemm_strided_batched")
 		purego.RegisterLibFunc(&gtGemmEx, lib, "gt_gemm_ex")
 		purego.RegisterLibFunc(&gtGemmStridedBatchedEx, lib, "gt_gemm_strided_batched_ex")
+		purego.RegisterLibFunc(&gtLtMatmulFp8E4M3, lib, "gt_lt_matmul_fp8_e4m3")
 		hasBlasWrapper = true
 	})
 }

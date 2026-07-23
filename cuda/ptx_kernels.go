@@ -10,8 +10,8 @@ package cuda
 // использует one-per-line во всех sample PTX. См. отчёт stage4 §PTX-format.
 
 const r02bKernelsPTX = `
-.version 7.0
-.target sm_80
+.version 8.1
+.target sm_89
 .address_size 64
 
 .visible .entry add_f64(
@@ -2792,6 +2792,187 @@ $L_cvt_f32_f16_end:
     add.u64 %addr, %dst, %off;
     st.global.f32 [%addr], %v32;
 $L_cvt_f16_f32_end:
+    ret;
+}
+
+// ================================================================
+// B-impl-3: FP8 E4M3 quantize/dequantize.
+//
+// quantize_f32_to_f8e4m3(src, dst, scale, amax, n):
+//   phase 1: reduce absmax(src) into single float, use SMEM tree reduction
+//            (pattern from sum_f32). Only ONE block for simplicity (n<=65536
+// covers production shapes). For larger n, caller invokes multiple times
+// and aggregates host-side.
+//   phase 2: scale = amax / FP8_E4M3_MAX (=448.0), write to scale device ptr.
+//   phase 3: dst[i] = cvt.rn.satfinite.e4m3x2.f32 (src[i] / scale).
+//
+// FP8 E4M3 max = 448 (1.0*2^(15-7)=?, actually 1.111000_2 * 2^8 = 448).
+// Uses PTX cvt.rn.satfinite.e4m3x2.f32 (converts 2 F32 -> 2 E4M3 packed).
+//
+// Grid: 1 block for phase 1-2 (all data covered by loop); block=256.
+// After amax+scale, block=256 grid=ceil(n/512) for phase 3 (packed 2-per-thread).
+// In this simplified stage: single grid=1 block=256 kernel, works for
+// n <= threshold. Production -- separate TZ.
+// ================================================================
+.visible .entry quantize_f32_to_f8e4m3(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u64 p_scale,
+    .param .u64 p_amax,
+    .param .u32 p_n
+) {
+    .shared .align 4 .f32 sm_amax[256];
+    .reg .u32 %tidx, %n, %j, %stride, %addr_smem;
+    .reg .u32 %addr_smem_partner;
+    .reg .u64 %src, %dst, %scale_p, %amax_p, %addr, %off;
+    .reg .f32 %v, %av, %my_amax, %row_amax, %scale, %fp8max, %eps;
+    .reg .f32 %other, %inv_scale;
+    .reg .b16 %packed_hi16;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %scale_p, [p_scale];
+    ld.param.u64 %amax_p, [p_amax];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+
+    // Phase 1: per-thread accumulate absmax.
+    mov.f32 %my_amax, 0f00000000;
+    mov.u32 %j, %tidx;
+$L_q_loop:
+    setp.ge.u32 %p, %j, %n;
+    @%p bra $L_q_reduce;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v, [%addr];
+    abs.f32 %av, %v;
+    max.f32 %my_amax, %my_amax, %av;
+    add.u32 %j, %j, 256;
+    bra $L_q_loop;
+
+$L_q_reduce:
+    // SMEM tree reduction for amax.
+    shl.b32 %addr_smem, %tidx, 2;
+    mov.u32 %stride, sm_amax;
+    add.u32 %addr_smem, %addr_smem, %stride;
+    st.shared.f32 [%addr_smem], %my_amax;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$L_q_red_step:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $L_q_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $L_q_red_skip;
+    add.u32 %addr_smem_partner, %tidx, %stride;
+    shl.b32 %addr_smem_partner, %addr_smem_partner, 2;
+    mov.u32 %j, sm_amax;
+    add.u32 %addr_smem_partner, %addr_smem_partner, %j;
+    ld.shared.f32 %row_amax, [%addr_smem];
+    ld.shared.f32 %other, [%addr_smem_partner];
+    max.f32 %row_amax, %row_amax, %other;
+    st.shared.f32 [%addr_smem], %row_amax;
+$L_q_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $L_q_red_step;
+$L_q_red_done:
+    // Read final amax from sm_amax[0].
+    mov.u32 %j, sm_amax;
+    ld.shared.f32 %row_amax, [%j];
+    bar.sync 0;
+
+    // Phase 2: scale = amax / 448.  If amax < 1e-12 -> scale = 1.0.
+    // Write scale + amax to output (thread 0 only).
+    setp.ne.u32 %p, %tidx, 0;
+    @%p bra $L_q_after_scale;
+    mov.f32 %fp8max, 0f43E00000;   // 448.0
+    mov.f32 %eps, 0f00000000;      // 0.0 sentinel
+    mov.f32 %eps, 0f2ACBCCCC;      // 1e-13
+    setp.lt.f32 %p, %row_amax, %eps;
+    @%p mov.f32 %scale, 0f3F800000; // 1.0
+    @!%p div.rn.f32 %scale, %row_amax, %fp8max;
+    st.global.f32 [%scale_p], %scale;
+    st.global.f32 [%amax_p], %row_amax;
+$L_q_after_scale:
+    bar.sync 0;
+
+    // Broadcast scale via SMEM (thread 0 wrote it).
+    // Broadcast scale via global read.
+    ld.global.f32 %scale, [%scale_p];
+    // inv_scale = 1 / scale. div.approx.f32 is enough (F8 tolerance).
+    mov.f32 %inv_scale, 0f3F800000;
+    div.approx.f32 %inv_scale, %inv_scale, %scale;
+
+    // Phase 3: dst[i] = cvt.rn.satfinite.e4m3.f32 (src[i] * inv_scale).
+    // Each thread writes 1 elem to keep code simple.
+    mov.u32 %j, %tidx;
+$L_q_write_loop:
+    setp.ge.u32 %p, %j, %n;
+    @%p bra $L_q_write_end;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v, [%addr];
+    mul.f32 %v, %v, %inv_scale;
+    // cvt.rn.satfinite.e4m3x2.f32 -- packs 2 f32 into 16-bit hold. We use one
+    // input twice (both lanes same); write lower byte.
+    cvt.rn.satfinite.e4m3x2.f32 %packed_hi16, %v, %v;
+    // Extract low 8-bit and write.
+    mul.wide.u32 %off, %j, 1;
+    add.u64 %addr, %dst, %off;
+    st.global.b8 [%addr], %packed_hi16;
+    add.u32 %j, %j, 256;
+    bra $L_q_write_loop;
+$L_q_write_end:
+    ret;
+}
+
+// cast_f8e4m3_to_f32(src, dst, scale, n):
+// dst[i] = f8_to_f32(src[i]) * scale[0]. dequantize with per-tensor scale.
+// PTX cvt.rn.f32.e4m3x2 unpacks single f8 pair -> f32 pair; we handle scalar case.
+.visible .entry cast_f8e4m3_to_f32(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u64 p_scale,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %n, %idx;
+    .reg .u64 %src, %dst, %scale_p, %addr, %off;
+    .reg .b16 %packed_in, %f16lo, %f16hi_unused;
+    .reg .b32 %packed_f16x2;
+    .reg .f32 %vlo, %scale;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %scale_p, [p_scale];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $L_cast_f8_end;
+
+    ld.global.f32 %scale, [%scale_p];
+
+    // Load one byte as low e4m3, upper byte is dummy.
+    mul.wide.u32 %off, %idx, 1;
+    add.u64 %addr, %src, %off;
+    ld.global.b8 %packed_in, [%addr];
+    // Unpack e4m3x2 -> f16x2 (lower half valid, upper half from dummy byte).
+    cvt.rn.f16x2.e4m3x2 %packed_f16x2, %packed_in;
+    // Extract lower f16.
+    mov.b32 {%f16lo, %f16hi_unused}, %packed_f16x2;
+    // Widen f16 -> f32.
+    cvt.f32.f16 %vlo, %f16lo;
+    mul.f32 %vlo, %vlo, %scale;
+
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %addr, %dst, %off;
+    st.global.f32 [%addr], %vlo;
+$L_cast_f8_end:
     ret;
 }
 `

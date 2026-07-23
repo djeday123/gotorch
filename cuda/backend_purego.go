@@ -156,6 +156,8 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		"cvt_u64_to_u32",
 		// B-impl-2: F32<->F16 конверсии.
 		"cvt_f32_to_f16", "cvt_f16_to_f32",
+		// B-impl-3: FP8 E4M3 quantize/cast (MatMul через cublasLt wrapper, не PTX).
+		"quantize_f32_to_f8e4m3", "cast_f8e4m3_to_f32",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -1844,4 +1846,115 @@ func (b *PuregoBackend) CastF16ToF32(src, dst DeviceBuffer, n int) error {
 	}
 	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
 	return b.launchCvtF32F16("cvt_f16_to_f32", vs.ptr, vd.ptr, n)
+}
+
+// ──────────────────────────────────────────────────────────
+// B-impl-3: FP8 E4M3 MatMul через cublasLt (wrapper local Lt-handle).
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) MatMulF8E4M3(a, bb, c, scaleA, scaleB, scaleC, amaxD DeviceBuffer,
+	m, n, k int) error {
+	if m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulF8E4M3: m/n/k must be > 0")
+	}
+	if !HasBlasWrapper() {
+		return fmt.Errorf("cuda.MatMulF8E4M3: libgotorch_blas_wrapper.so required")
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	vsa, vsb, vsc := scaleA.deviceBuffer(), scaleB.deviceBuffer(), scaleC.deviceBuffer()
+	var amaxPtr uintptr
+	if amaxD != nil {
+		vamx := amaxD.deviceBuffer()
+		amaxPtr = vamx.ptr
+	}
+	args := Fp8E4M3MatmulArgs{
+		Stream: b.stream,
+		M:      int32(n), N: int32(m), K: int32(k), // swap for column-major
+		A:      vb.ptr, // swap
+		B:      va.ptr,
+		C:      vc.ptr,
+		Alpha:  unsafe.Pointer(&alpha),
+		Beta:   unsafe.Pointer(&beta),
+		ScaleA: vsb.ptr, // swap follows A/B swap
+		ScaleB: vsa.ptr,
+		ScaleC: vsc.ptr,
+		AmaxD:  amaxPtr,
+	}
+	st := gtLtMatmulFp8E4M3(unsafe.Pointer(&args))
+	if st != int32(CUBLAS_STATUS_SUCCESS) {
+		return fmt.Errorf("gt_lt_matmul_fp8_e4m3: %s", cublasStatus(st).Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("cuda.QuantizeF32ToF8E4M3: n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	fn, err := b.getKernel("quantize_f32_to_f8e4m3")
+	if err != nil {
+		return err
+	}
+	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
+	vsc, vam := scale.deviceBuffer(), amax.deviceBuffer()
+	args := struct {
+		src, dst, scale, amax uintptr
+		n                     int32
+		_                     int32
+	}{vs.ptr, vd.ptr, vsc.ptr, vam.ptr, int32(n), 0}
+	params := [5]unsafe.Pointer{
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.scale),
+		unsafe.Pointer(&args.amax),
+		unsafe.Pointer(&args.n),
+	}
+	if r := cuLaunchKernel(fn, 1, 1, 1, 256, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(quantize_f32_to_f8e4m3): %s", r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) CastF8E4M3ToF32(src, dst, scale DeviceBuffer, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("cuda.CastF8E4M3ToF32: n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	fn, err := b.getKernel("cast_f8e4m3_to_f32")
+	if err != nil {
+		return err
+	}
+	vs, vd, vsc := src.deviceBuffer(), dst.deviceBuffer(), scale.deviceBuffer()
+	args := struct {
+		src, dst, scale uintptr
+		n               int32
+		_               int32
+	}{vs.ptr, vd.ptr, vsc.ptr, int32(n), 0}
+	params := [4]unsafe.Pointer{
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.scale),
+		unsafe.Pointer(&args.n),
+	}
+	grid, block := launchGrid(n)
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(cast_f8e4m3_to_f32): %s", r.Error())
+	}
+	return nil
 }
