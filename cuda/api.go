@@ -183,6 +183,21 @@ type Backend interface {
 	SoftmaxF64(a, c DeviceBuffer, rows, cols int) error
 	SoftmaxF32(a, c DeviceBuffer, rows, cols int) error
 
+	// --- Normalization: RMSNorm (LLaMA-style, no bias/mean-subtract) ---
+	//
+	// y = gamma * x / rms, где rms = sqrt(mean(x²) + eps).
+	// x, gamma, y — [rows, cols] row-major; gamma — [cols].
+	// Forward: RMSNormF32/F64.
+	// Backward:
+	//   dx_j     = gamma_j*dy_j*inv_rms - x_j*S*inv_rms^3/cols
+	//   dgamma_j = sum_rows(dy_j*x_j*inv_rms)  (atomicAdd; dgamma должен быть pre-zeroed)
+	//   где S = sum_i(gamma_i*x_i*dy_i)
+	// Grad-функции сами обнуляют dgamma через cuMemsetD8 перед kernel'ом.
+	RMSNormF64(x, gamma, y DeviceBuffer, rows, cols int, eps float64) error
+	RMSNormF32(x, gamma, y DeviceBuffer, rows, cols int, eps float32) error
+	RMSNormGradF64(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float64) error
+	RMSNormGradF32(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float32) error
+
 	// --- Reduce F64/F32 ---
 
 	SumF64(a DeviceBuffer, n int) (float64, error)

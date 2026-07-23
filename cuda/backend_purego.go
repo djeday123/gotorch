@@ -137,6 +137,9 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		// Stage 5 composite operations
 		"sum_f64", "sum_f32",
 		"softmax_f64", "softmax_f32",
+		// P2-RMS: RMSNorm forward + backward
+		"rmsnorm_f32", "rmsnorm_f64",
+		"rmsnorm_grad_f32", "rmsnorm_grad_f64",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -671,6 +674,213 @@ func (b *PuregoBackend) SoftmaxF32(a, c DeviceBuffer, rows, cols int) error {
 		return err
 	}
 	return b.launchSoftmax("softmax_f32", a, c, rows, cols)
+}
+
+// ──────────────────────────────────────────────────────────
+// P2-RMS: RMSNorm forward + backward (F64/F32).
+// Row-parallel: 1 CTA per row, block=256, SMEM tree-reduction для sum(x²) и S.
+// ──────────────────────────────────────────────────────────
+
+// launchRMSNormF32 — kernel launch без eps-конверсии.
+func (b *PuregoBackend) launchRMSNormF32(x, gamma, y DeviceBuffer, rows, cols int, eps float32) error {
+	fn, err := b.getKernel("rmsnorm_f32")
+	if err != nil {
+		return err
+	}
+	vx, vg, vy := x.deviceBuffer(), gamma.deviceBuffer(), y.deviceBuffer()
+	args := struct {
+		x    uintptr
+		g    uintptr
+		y    uintptr
+		rows int32
+		cols int32
+		eps  float32
+	}{vx.ptr, vg.ptr, vy.ptr, int32(rows), int32(cols), eps}
+	params := [6]unsafe.Pointer{
+		unsafe.Pointer(&args.x),
+		unsafe.Pointer(&args.g),
+		unsafe.Pointer(&args.y),
+		unsafe.Pointer(&args.rows),
+		unsafe.Pointer(&args.cols),
+		unsafe.Pointer(&args.eps),
+	}
+	if r := cuLaunchKernel(fn,
+		uint32(rows), 1, 1,
+		256, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(rmsnorm_f32): %s", r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) launchRMSNormF64(x, gamma, y DeviceBuffer, rows, cols int, eps float64) error {
+	fn, err := b.getKernel("rmsnorm_f64")
+	if err != nil {
+		return err
+	}
+	vx, vg, vy := x.deviceBuffer(), gamma.deviceBuffer(), y.deviceBuffer()
+	args := struct {
+		x    uintptr
+		g    uintptr
+		y    uintptr
+		rows int32
+		cols int32
+		eps  float64
+	}{vx.ptr, vg.ptr, vy.ptr, int32(rows), int32(cols), eps}
+	params := [6]unsafe.Pointer{
+		unsafe.Pointer(&args.x),
+		unsafe.Pointer(&args.g),
+		unsafe.Pointer(&args.y),
+		unsafe.Pointer(&args.rows),
+		unsafe.Pointer(&args.cols),
+		unsafe.Pointer(&args.eps),
+	}
+	if r := cuLaunchKernel(fn,
+		uint32(rows), 1, 1,
+		256, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(rmsnorm_f64): %s", r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) RMSNormF32(x, gamma, y DeviceBuffer, rows, cols int, eps float32) error {
+	if rows <= 0 || cols <= 0 {
+		return fmt.Errorf("cuda.RMSNormF32: rows/cols must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRMSNormF32(x, gamma, y, rows, cols, eps)
+}
+
+func (b *PuregoBackend) RMSNormF64(x, gamma, y DeviceBuffer, rows, cols int, eps float64) error {
+	if rows <= 0 || cols <= 0 {
+		return fmt.Errorf("cuda.RMSNormF64: rows/cols must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRMSNormF64(x, gamma, y, rows, cols, eps)
+}
+
+func (b *PuregoBackend) launchRMSNormGradF32(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float32) error {
+	fn, err := b.getKernel("rmsnorm_grad_f32")
+	if err != nil {
+		return err
+	}
+	vx, vg, vdy, vdx, vdg := x.deviceBuffer(), gamma.deviceBuffer(), dy.deviceBuffer(), dx.deviceBuffer(), dgamma.deviceBuffer()
+	args := struct {
+		x      uintptr
+		g      uintptr
+		dy     uintptr
+		dx     uintptr
+		dgamma uintptr
+		rows   int32
+		cols   int32
+		eps    float32
+	}{vx.ptr, vg.ptr, vdy.ptr, vdx.ptr, vdg.ptr, int32(rows), int32(cols), eps}
+	params := [8]unsafe.Pointer{
+		unsafe.Pointer(&args.x),
+		unsafe.Pointer(&args.g),
+		unsafe.Pointer(&args.dy),
+		unsafe.Pointer(&args.dx),
+		unsafe.Pointer(&args.dgamma),
+		unsafe.Pointer(&args.rows),
+		unsafe.Pointer(&args.cols),
+		unsafe.Pointer(&args.eps),
+	}
+	if r := cuLaunchKernel(fn,
+		uint32(rows), 1, 1,
+		256, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(rmsnorm_grad_f32): %s", r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) launchRMSNormGradF64(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float64) error {
+	fn, err := b.getKernel("rmsnorm_grad_f64")
+	if err != nil {
+		return err
+	}
+	vx, vg, vdy, vdx, vdg := x.deviceBuffer(), gamma.deviceBuffer(), dy.deviceBuffer(), dx.deviceBuffer(), dgamma.deviceBuffer()
+	args := struct {
+		x      uintptr
+		g      uintptr
+		dy     uintptr
+		dx     uintptr
+		dgamma uintptr
+		rows   int32
+		cols   int32
+		eps    float64
+	}{vx.ptr, vg.ptr, vdy.ptr, vdx.ptr, vdg.ptr, int32(rows), int32(cols), eps}
+	params := [8]unsafe.Pointer{
+		unsafe.Pointer(&args.x),
+		unsafe.Pointer(&args.g),
+		unsafe.Pointer(&args.dy),
+		unsafe.Pointer(&args.dx),
+		unsafe.Pointer(&args.dgamma),
+		unsafe.Pointer(&args.rows),
+		unsafe.Pointer(&args.cols),
+		unsafe.Pointer(&args.eps),
+	}
+	if r := cuLaunchKernel(fn,
+		uint32(rows), 1, 1,
+		256, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(rmsnorm_grad_f64): %s", r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) RMSNormGradF32(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float32) error {
+	if rows <= 0 || cols <= 0 {
+		return fmt.Errorf("cuda.RMSNormGradF32: rows/cols must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	// dgamma должен быть pre-zeroed перед atomicAdd-reduction.
+	vdg := dgamma.deviceBuffer()
+	if r := cuMemsetD8(vdg.ptr, 0, uint64(cols*4)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dgamma f32): %s", r.Error())
+	}
+	return b.launchRMSNormGradF32(x, gamma, dy, dx, dgamma, rows, cols, eps)
+}
+
+func (b *PuregoBackend) RMSNormGradF64(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float64) error {
+	if rows <= 0 || cols <= 0 {
+		return fmt.Errorf("cuda.RMSNormGradF64: rows/cols must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	vdg := dgamma.deviceBuffer()
+	if r := cuMemsetD8(vdg.ptr, 0, uint64(cols*8)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dgamma f64): %s", r.Error())
+	}
+	return b.launchRMSNormGradF64(x, gamma, dy, dx, dgamma, rows, cols, eps)
 }
 
 // ──────────────────────────────────────────────────────────

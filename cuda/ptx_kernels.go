@@ -1630,6 +1630,532 @@ $Lsm_f32_div_loop:
 $Lsoftmax_f32_end:
     ret;
 }
+
+// ================================================================
+// P2-RMS: RMSNorm forward + backward, F32 and F64.
+// y = gamma * x / rms, where rms = sqrt(mean(x^2) + eps).
+// Backward:
+//   inv_rms = 1/rms
+//   dx_j    = gamma_j * dy_j * inv_rms - x_j * S * inv_rms^3 / cols
+//     where S = sum_i(gamma_i * x_i * dy_i)
+//   dgamma_j = sum_rows(dy * x / rms)  -- atomicAdd across rows (dgamma must be pre-zeroed).
+// Schema: 1 block per row (block=256 threads), SMEM tree reduction for sum2 and S.
+// F32 uses F64 accumulator for sum(x^2) (proven pattern from sum_f32/softmax_f32).
+// ================================================================
+
+// rmsnorm_f32: y = gamma * x / sqrt(mean(x^2)+eps). Row-parallel.
+.visible .entry rmsnorm_f32(
+    .param .u64 p_x,
+    .param .u64 p_gamma,
+    .param .u64 p_y,
+    .param .u32 p_rows,
+    .param .u32 p_cols,
+    .param .f32 p_eps
+) {
+    .shared .align 8 .u64 sm_rms_sum_f32[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems, %sum_base, %sum_addr, %sum_partner;
+    .reg .u64 %x, %gamma, %y, %off, %px, %py, %pg, %row_off_bytes;
+    .reg .f32 %xv, %gv, %yv, %eps, %inv_rms32, %mean_sum, %fcols;
+    .reg .f64 %my_sum, %row_sum, %xv_wide, %xsq, %other64, %sum_val;
+    .reg .pred %p;
+
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %gamma, [p_gamma];
+    ld.param.u64 %y, [p_y];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    ld.param.f32 %eps, [p_eps];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lrms_f32_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 4;
+    add.u64 %px, %x, %row_off_bytes;
+    add.u64 %py, %y, %row_off_bytes;
+
+    mov.u32 %sum_base, sm_rms_sum_f32;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+
+    // Phase 1: sum(x^2) per row via F64 accumulator, then SMEM tree reduction.
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lrms_f32_sum_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lrms_f32_sum_reduce;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %px, %px, %off;
+    ld.global.f32 %xv, [%px];
+    sub.u64 %px, %px, %off;
+    cvt.f64.f32 %xv_wide, %xv;
+    mul.f64 %xsq, %xv_wide, %xv_wide;
+    add.f64 %my_sum, %my_sum, %xsq;
+    add.u32 %j, %j, 256;
+    bra $Lrms_f32_sum_loop;
+$Lrms_f32_sum_reduce:
+    st.shared.f64 [%sum_addr], %my_sum;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lrms_f32_sum_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lrms_f32_sum_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lrms_f32_sum_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %sum_val, [%sum_addr];
+    ld.shared.f64 %other64, [%sum_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%sum_addr], %sum_val;
+$Lrms_f32_sum_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lrms_f32_sum_red_loop;
+$Lrms_f32_sum_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    bar.sync 0;
+
+    // Phase 2: rms = sqrt(row_sum/cols + eps); inv_rms = 1/rms in F32 via rsqrt.approx.f32.
+    cvt.rn.f32.f64 %mean_sum, %row_sum;
+    cvt.rn.f32.u32 %fcols, %cols;
+    div.rn.f32 %mean_sum, %mean_sum, %fcols;
+    add.f32 %mean_sum, %mean_sum, %eps;
+    rsqrt.approx.f32 %inv_rms32, %mean_sum;
+
+    // Phase 3: y[col] = gamma[col] * x[col] * inv_rms.
+    mov.u32 %j, %tidx;
+$Lrms_f32_apply_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lrms_f32_end;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %px, %px, %off;
+    add.u64 %py, %py, %off;
+    add.u64 %pg, %gamma, %off;
+    ld.global.f32 %xv, [%px];
+    ld.global.f32 %gv, [%pg];
+    mul.f32 %yv, %xv, %inv_rms32;
+    mul.f32 %yv, %yv, %gv;
+    st.global.f32 [%py], %yv;
+    sub.u64 %px, %px, %off;
+    sub.u64 %py, %py, %off;
+    add.u32 %j, %j, 256;
+    bra $Lrms_f32_apply_loop;
+$Lrms_f32_end:
+    ret;
+}
+
+// rmsnorm_f64: F64 IO + F64 sqrt/div (no approx).
+.visible .entry rmsnorm_f64(
+    .param .u64 p_x,
+    .param .u64 p_gamma,
+    .param .u64 p_y,
+    .param .u32 p_rows,
+    .param .u32 p_cols,
+    .param .f64 p_eps
+) {
+    .shared .align 8 .u64 sm_rms_sum_f64[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems, %sum_base, %sum_addr, %sum_partner;
+    .reg .u64 %x, %gamma, %y, %off, %px, %py, %pg, %row_off_bytes;
+    .reg .f64 %xv, %gv, %yv, %eps, %inv_rms, %rms, %mean_sum, %fcols;
+    .reg .f64 %my_sum, %row_sum, %xsq, %other64, %sum_val, %one;
+    .reg .pred %p;
+
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %gamma, [p_gamma];
+    ld.param.u64 %y, [p_y];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    ld.param.f64 %eps, [p_eps];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lrms_f64_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 8;
+    add.u64 %px, %x, %row_off_bytes;
+    add.u64 %py, %y, %row_off_bytes;
+
+    mov.u32 %sum_base, sm_rms_sum_f64;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+
+    // Phase 1: sum(x^2) per row, F64 accumulator.
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lrms_f64_sum_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lrms_f64_sum_reduce;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %px, %px, %off;
+    ld.global.f64 %xv, [%px];
+    sub.u64 %px, %px, %off;
+    mul.f64 %xsq, %xv, %xv;
+    add.f64 %my_sum, %my_sum, %xsq;
+    add.u32 %j, %j, 256;
+    bra $Lrms_f64_sum_loop;
+$Lrms_f64_sum_reduce:
+    st.shared.f64 [%sum_addr], %my_sum;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lrms_f64_sum_red_loop:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lrms_f64_sum_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lrms_f64_sum_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %sum_val, [%sum_addr];
+    ld.shared.f64 %other64, [%sum_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%sum_addr], %sum_val;
+$Lrms_f64_sum_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lrms_f64_sum_red_loop;
+$Lrms_f64_sum_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    bar.sync 0;
+
+    // Phase 2: rms = sqrt(row_sum/cols + eps); inv_rms = 1/rms (F64, no approx).
+    cvt.rn.f64.u32 %fcols, %cols;
+    div.rn.f64 %mean_sum, %row_sum, %fcols;
+    add.f64 %mean_sum, %mean_sum, %eps;
+    sqrt.rn.f64 %rms, %mean_sum;
+    mov.f64 %one, 0d3FF0000000000000;
+    div.rn.f64 %inv_rms, %one, %rms;
+
+    // Phase 3: y[col] = gamma[col] * x[col] * inv_rms.
+    mov.u32 %j, %tidx;
+$Lrms_f64_apply_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lrms_f64_end;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %px, %px, %off;
+    add.u64 %py, %py, %off;
+    add.u64 %pg, %gamma, %off;
+    ld.global.f64 %xv, [%px];
+    ld.global.f64 %gv, [%pg];
+    mul.f64 %yv, %xv, %inv_rms;
+    mul.f64 %yv, %yv, %gv;
+    st.global.f64 [%py], %yv;
+    sub.u64 %px, %px, %off;
+    sub.u64 %py, %py, %off;
+    add.u32 %j, %j, 256;
+    bra $Lrms_f64_apply_loop;
+$Lrms_f64_end:
+    ret;
+}
+
+// rmsnorm_grad_f32: computes dx and dgamma. dgamma must be pre-zeroed (atomicAdd across rows).
+// 1 block per row.
+.visible .entry rmsnorm_grad_f32(
+    .param .u64 p_x,
+    .param .u64 p_gamma,
+    .param .u64 p_dy,
+    .param .u64 p_dx,
+    .param .u64 p_dgamma,
+    .param .u32 p_rows,
+    .param .u32 p_cols,
+    .param .f32 p_eps
+) {
+    .shared .align 8 .u64 sm_grms_sum_f32[256];
+    .shared .align 8 .u64 sm_grms_S_f32[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems, %sum_base, %sum_addr, %sum_partner;
+    .reg .u32 %s_base, %s_addr, %s_partner;
+    .reg .u64 %x, %gamma, %dy, %dx, %dgamma, %off, %px, %pdy, %pdx, %pg, %pdg, %row_off_bytes;
+    .reg .f32 %xv, %gv, %dyv, %dxv, %dgv, %eps, %inv_rms32, %inv_rms3_over_cols;
+    .reg .f32 %mean_sum, %fcols, %term1, %term2, %S32;
+    .reg .f64 %my_sum, %row_sum, %xv_wide, %xsq, %other64, %sum_val;
+    .reg .f64 %my_S, %row_S, %S_prod, %dy_wide, %g_wide;
+    .reg .pred %p;
+
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %gamma, [p_gamma];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dx, [p_dx];
+    ld.param.u64 %dgamma, [p_dgamma];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    ld.param.f32 %eps, [p_eps];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lgrms_f32_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 4;
+    add.u64 %px, %x, %row_off_bytes;
+    add.u64 %pdy, %dy, %row_off_bytes;
+    add.u64 %pdx, %dx, %row_off_bytes;
+
+    mov.u32 %sum_base, sm_grms_sum_f32;
+    mov.u32 %s_base, sm_grms_S_f32;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+    shl.b32 %s_addr, %tidx, 3;
+    add.u32 %s_addr, %s_addr, %s_base;
+
+    // Phase 1: sum(x^2) + S = sum(gamma * x * dy). Two accumulators in one loop.
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.f64 %my_S, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lgrms_f32_reduce_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lgrms_f32_reduce_done;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %px, %px, %off;
+    add.u64 %pdy, %pdy, %off;
+    add.u64 %pg, %gamma, %off;
+    ld.global.f32 %xv, [%px];
+    ld.global.f32 %dyv, [%pdy];
+    ld.global.f32 %gv, [%pg];
+    cvt.f64.f32 %xv_wide, %xv;
+    cvt.f64.f32 %dy_wide, %dyv;
+    cvt.f64.f32 %g_wide, %gv;
+    mul.f64 %xsq, %xv_wide, %xv_wide;
+    add.f64 %my_sum, %my_sum, %xsq;
+    mul.f64 %S_prod, %g_wide, %xv_wide;
+    mul.f64 %S_prod, %S_prod, %dy_wide;
+    add.f64 %my_S, %my_S, %S_prod;
+    sub.u64 %px, %px, %off;
+    sub.u64 %pdy, %pdy, %off;
+    add.u32 %j, %j, 256;
+    bra $Lgrms_f32_reduce_loop;
+$Lgrms_f32_reduce_done:
+    st.shared.f64 [%sum_addr], %my_sum;
+    st.shared.f64 [%s_addr], %my_S;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lgrms_f32_red_step:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lgrms_f32_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lgrms_f32_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %sum_val, [%sum_addr];
+    ld.shared.f64 %other64, [%sum_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%sum_addr], %sum_val;
+    add.u32 %s_partner, %tidx, %stride;
+    shl.b32 %s_partner, %s_partner, 3;
+    add.u32 %s_partner, %s_partner, %s_base;
+    ld.shared.f64 %sum_val, [%s_addr];
+    ld.shared.f64 %other64, [%s_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%s_addr], %sum_val;
+$Lgrms_f32_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lgrms_f32_red_step;
+$Lgrms_f32_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    ld.shared.f64 %row_S, [%s_base];
+    bar.sync 0;
+
+    // Phase 2: compute inv_rms and inv_rms^3 / cols.
+    cvt.rn.f32.f64 %mean_sum, %row_sum;
+    cvt.rn.f32.u32 %fcols, %cols;
+    div.rn.f32 %mean_sum, %mean_sum, %fcols;
+    add.f32 %mean_sum, %mean_sum, %eps;
+    rsqrt.approx.f32 %inv_rms32, %mean_sum;
+    mul.f32 %inv_rms3_over_cols, %inv_rms32, %inv_rms32;
+    mul.f32 %inv_rms3_over_cols, %inv_rms3_over_cols, %inv_rms32;
+    div.rn.f32 %inv_rms3_over_cols, %inv_rms3_over_cols, %fcols;
+    cvt.rn.f32.f64 %S32, %row_S;
+
+    // Phase 3: dx[j] = gamma_j*dy_j*inv_rms - x_j*S*inv_rms^3/cols;
+    //          dgamma[j] += dy_j*x_j*inv_rms  (atomicAdd across rows).
+    mov.u32 %j, %tidx;
+$Lgrms_f32_apply_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lgrms_f32_end;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %px, %px, %off;
+    add.u64 %pdy, %pdy, %off;
+    add.u64 %pdx, %pdx, %off;
+    add.u64 %pg, %gamma, %off;
+    add.u64 %pdg, %dgamma, %off;
+    ld.global.f32 %xv, [%px];
+    ld.global.f32 %dyv, [%pdy];
+    ld.global.f32 %gv, [%pg];
+    // term1 = gamma_j * dy_j * inv_rms
+    mul.f32 %term1, %gv, %dyv;
+    mul.f32 %term1, %term1, %inv_rms32;
+    // term2 = x_j * S * inv_rms^3 / cols
+    mul.f32 %term2, %xv, %S32;
+    mul.f32 %term2, %term2, %inv_rms3_over_cols;
+    sub.f32 %dxv, %term1, %term2;
+    st.global.f32 [%pdx], %dxv;
+    // dgamma += dy_j * x_j * inv_rms (atomic).
+    mul.f32 %dgv, %dyv, %xv;
+    mul.f32 %dgv, %dgv, %inv_rms32;
+    atom.global.add.f32 %dgv, [%pdg], %dgv;
+    sub.u64 %px, %px, %off;
+    sub.u64 %pdy, %pdy, %off;
+    sub.u64 %pdx, %pdx, %off;
+    add.u32 %j, %j, 256;
+    bra $Lgrms_f32_apply_loop;
+$Lgrms_f32_end:
+    ret;
+}
+
+// rmsnorm_grad_f64: F64 version. Use sqrt.rn.f64+div.rn.f64 (no approx); atomic.add.f64.
+.visible .entry rmsnorm_grad_f64(
+    .param .u64 p_x,
+    .param .u64 p_gamma,
+    .param .u64 p_dy,
+    .param .u64 p_dx,
+    .param .u64 p_dgamma,
+    .param .u32 p_rows,
+    .param .u32 p_cols,
+    .param .f64 p_eps
+) {
+    .shared .align 8 .u64 sm_grms_sum_f64[256];
+    .shared .align 8 .u64 sm_grms_S_f64[256];
+    .reg .u32 %tidx, %row, %cols, %rows, %j, %stride;
+    .reg .u32 %row_off_elems, %sum_base, %sum_addr, %sum_partner;
+    .reg .u32 %s_base, %s_addr, %s_partner;
+    .reg .u64 %x, %gamma, %dy, %dx, %dgamma, %off, %px, %pdy, %pdx, %pg, %pdg, %row_off_bytes;
+    .reg .f64 %xv, %gv, %dyv, %dxv, %dgv, %eps, %inv_rms, %rms, %inv_rms3_over_cols;
+    .reg .f64 %mean_sum, %fcols, %term1, %term2, %one;
+    .reg .f64 %my_sum, %row_sum, %xsq, %other64, %sum_val;
+    .reg .f64 %my_S, %row_S, %S_prod;
+    .reg .pred %p;
+
+    ld.param.u64 %x, [p_x];
+    ld.param.u64 %gamma, [p_gamma];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %dx, [p_dx];
+    ld.param.u64 %dgamma, [p_dgamma];
+    ld.param.u32 %rows, [p_rows];
+    ld.param.u32 %cols, [p_cols];
+    ld.param.f64 %eps, [p_eps];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %rows;
+    @%p bra $Lgrms_f64_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.lo.u32 %row_off_elems, %row, %cols;
+    mul.wide.u32 %row_off_bytes, %row_off_elems, 8;
+    add.u64 %px, %x, %row_off_bytes;
+    add.u64 %pdy, %dy, %row_off_bytes;
+    add.u64 %pdx, %dx, %row_off_bytes;
+
+    mov.u32 %sum_base, sm_grms_sum_f64;
+    mov.u32 %s_base, sm_grms_S_f64;
+    shl.b32 %sum_addr, %tidx, 3;
+    add.u32 %sum_addr, %sum_addr, %sum_base;
+    shl.b32 %s_addr, %tidx, 3;
+    add.u32 %s_addr, %s_addr, %s_base;
+
+    // Phase 1: sum(x^2) + S in F64.
+    mov.f64 %my_sum, 0d0000000000000000;
+    mov.f64 %my_S, 0d0000000000000000;
+    mov.u32 %j, %tidx;
+$Lgrms_f64_reduce_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lgrms_f64_reduce_done;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %px, %px, %off;
+    add.u64 %pdy, %pdy, %off;
+    add.u64 %pg, %gamma, %off;
+    ld.global.f64 %xv, [%px];
+    ld.global.f64 %dyv, [%pdy];
+    ld.global.f64 %gv, [%pg];
+    mul.f64 %xsq, %xv, %xv;
+    add.f64 %my_sum, %my_sum, %xsq;
+    mul.f64 %S_prod, %gv, %xv;
+    mul.f64 %S_prod, %S_prod, %dyv;
+    add.f64 %my_S, %my_S, %S_prod;
+    sub.u64 %px, %px, %off;
+    sub.u64 %pdy, %pdy, %off;
+    add.u32 %j, %j, 256;
+    bra $Lgrms_f64_reduce_loop;
+$Lgrms_f64_reduce_done:
+    st.shared.f64 [%sum_addr], %my_sum;
+    st.shared.f64 [%s_addr], %my_S;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$Lgrms_f64_red_step:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $Lgrms_f64_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $Lgrms_f64_red_skip;
+    add.u32 %sum_partner, %tidx, %stride;
+    shl.b32 %sum_partner, %sum_partner, 3;
+    add.u32 %sum_partner, %sum_partner, %sum_base;
+    ld.shared.f64 %sum_val, [%sum_addr];
+    ld.shared.f64 %other64, [%sum_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%sum_addr], %sum_val;
+    add.u32 %s_partner, %tidx, %stride;
+    shl.b32 %s_partner, %s_partner, 3;
+    add.u32 %s_partner, %s_partner, %s_base;
+    ld.shared.f64 %sum_val, [%s_addr];
+    ld.shared.f64 %other64, [%s_partner];
+    add.f64 %sum_val, %sum_val, %other64;
+    st.shared.f64 [%s_addr], %sum_val;
+$Lgrms_f64_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $Lgrms_f64_red_step;
+$Lgrms_f64_red_done:
+    ld.shared.f64 %row_sum, [%sum_base];
+    ld.shared.f64 %row_S, [%s_base];
+    bar.sync 0;
+
+    // Phase 2: rms, inv_rms in F64 (no approx).
+    cvt.rn.f64.u32 %fcols, %cols;
+    div.rn.f64 %mean_sum, %row_sum, %fcols;
+    add.f64 %mean_sum, %mean_sum, %eps;
+    sqrt.rn.f64 %rms, %mean_sum;
+    mov.f64 %one, 0d3FF0000000000000;
+    div.rn.f64 %inv_rms, %one, %rms;
+    mul.f64 %inv_rms3_over_cols, %inv_rms, %inv_rms;
+    mul.f64 %inv_rms3_over_cols, %inv_rms3_over_cols, %inv_rms;
+    div.rn.f64 %inv_rms3_over_cols, %inv_rms3_over_cols, %fcols;
+
+    // Phase 3: dx and dgamma.
+    mov.u32 %j, %tidx;
+$Lgrms_f64_apply_loop:
+    setp.ge.u32 %p, %j, %cols;
+    @%p bra $Lgrms_f64_end;
+    mul.wide.u32 %off, %j, 8;
+    add.u64 %px, %px, %off;
+    add.u64 %pdy, %pdy, %off;
+    add.u64 %pdx, %pdx, %off;
+    add.u64 %pg, %gamma, %off;
+    add.u64 %pdg, %dgamma, %off;
+    ld.global.f64 %xv, [%px];
+    ld.global.f64 %dyv, [%pdy];
+    ld.global.f64 %gv, [%pg];
+    mul.f64 %term1, %gv, %dyv;
+    mul.f64 %term1, %term1, %inv_rms;
+    mul.f64 %term2, %xv, %row_S;
+    mul.f64 %term2, %term2, %inv_rms3_over_cols;
+    sub.f64 %dxv, %term1, %term2;
+    st.global.f64 [%pdx], %dxv;
+    mul.f64 %dgv, %dyv, %xv;
+    mul.f64 %dgv, %dgv, %inv_rms;
+    atom.global.add.f64 %dgv, [%pdg], %dgv;
+    sub.u64 %px, %px, %off;
+    sub.u64 %pdy, %pdy, %off;
+    sub.u64 %pdx, %pdx, %off;
+    add.u32 %j, %j, 256;
+    bra $Lgrms_f64_apply_loop;
+$Lgrms_f64_end:
+    ret;
+}
 `
 // END-OF-STAGE-5-DISABLED-BLOCK-BELOW
 var _ = `
