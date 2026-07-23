@@ -221,6 +221,30 @@ type Backend interface {
 	EmbeddingGradF32(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
 	EmbeddingGradF64(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
 
+	// --- RoPE: Rotary Positional Embedding ---
+	//
+	// x, out: [batch, heads, seqLen, headDim] row-major, F32 или F64.
+	// Half-раскладка пар: (x[i], x[i+half]) где half = headDim/2. НЕ (2i, 2i+1).
+	// Формула forward: angle = pos * base^(-2i/headDim)
+	//   dst[i]      = src[i]*cos - src[i+half]*sin
+	//   dst[i+half] = src[i]*sin + src[i+half]*cos
+	// Формула backward (rotation на минус-угол):
+	//   dx[i]      = dy[i]*cos + dy[i+half]*sin
+	//   dx[i+half] = -dy[i]*sin + dy[i+half]*cos
+	//
+	// F32-путь: sin/cos через .approx на лету -- bit-exact vs goml.cuda.rope_f32.
+	// F64-путь: cos/sin читаются из host-precomputed таблиц [seqLen, half_dim] F64.
+	//   Обоснование таблиц: fdlibm F64 sin/cos = 200+ строк PTX; таблица O(sl*half*8)
+	//   ~4MB на sl=8192/hd=128 -- приемлемо. Судья <=1e-12 держит через host math.Cos/Sin.
+	//   Пользователь генерирует таблицы Go-side (детерминированно, тестируется отдельно).
+	//
+	// Positions: pos = bid % seqLen (0..seqLen-1); posOffset НЕ поддерживается
+	// (соответствует эталону goml для training-путей).
+	RoPEF32(x, out DeviceBuffer, batch, heads, seqLen, headDim int, base float32) error
+	RoPEGradF32(dy, dx DeviceBuffer, batch, heads, seqLen, headDim int, base float32) error
+	RoPEF64(x, cosTable, sinTable, out DeviceBuffer, batch, heads, seqLen, headDim int) error
+	RoPEGradF64(dy, cosTable, sinTable, dx DeviceBuffer, batch, heads, seqLen, headDim int) error
+
 	// --- Reduce F64/F32 ---
 
 	SumF64(a DeviceBuffer, n int) (float64, error)

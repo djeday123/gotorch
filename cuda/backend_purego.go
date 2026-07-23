@@ -143,6 +143,9 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		// P3-EMB: Embedding forward (gather) + backward (scatter atomicAdd)
 		"embedding_f32", "embedding_f64",
 		"embedding_grad_f32", "embedding_grad_f64",
+		// P4-ROPE: RoPE F32 (on-the-fly sin/cos.approx) + F64 (host cos/sin tables)
+		"rope_f32", "rope_grad_f32",
+		"rope_f64", "rope_grad_f64",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -1018,6 +1021,137 @@ func (b *PuregoBackend) EmbeddingGradF64(indices, dout, dtable DeviceBuffer, voc
 		return fmt.Errorf("cuMemsetD8(dtable f64): %s", r.Error())
 	}
 	return b.launchEmbeddingGrad("embedding_grad_f64", indices, dout, dtable, hidden, n)
+}
+
+// ──────────────────────────────────────────────────────────
+// P4-ROPE: RoPE F32 (on-the-fly sin/cos.approx) + F64 (host cos/sin tables).
+// Grid: (batch*heads*seqLen, 1, 1); block: min(halfDim, 256).
+// F32-путь bit-exact vs goml.cuda.rope_f32 (idempotent PTX copy).
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) ropeBlockDim(headDim int) uint32 {
+	half := uint32(headDim / 2)
+	if half > 256 {
+		return 256
+	}
+	if half == 0 {
+		return 1
+	}
+	return half
+}
+
+func (b *PuregoBackend) launchRoPEF32(fnName string, src, dst DeviceBuffer, batch, heads, seqLen, headDim int, base float32) error {
+	fn, err := b.getKernel(fnName)
+	if err != nil {
+		return err
+	}
+	// PTX param order: p_dst, p_src, p_seq_len, p_head_dim, p_num_heads, p_base.
+	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
+	args := struct {
+		dst     uintptr
+		src     uintptr
+		seqLen  int32
+		headDim int32
+		heads   int32
+		base    float32
+	}{vd.ptr, vs.ptr, int32(seqLen), int32(headDim), int32(heads), base}
+	params := [6]unsafe.Pointer{
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.seqLen),
+		unsafe.Pointer(&args.headDim),
+		unsafe.Pointer(&args.heads),
+		unsafe.Pointer(&args.base),
+	}
+	gridX := uint32(batch * heads * seqLen)
+	blockX := b.ropeBlockDim(headDim)
+	if r := cuLaunchKernel(fn, gridX, 1, 1, blockX, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) launchRoPEF64(fnName string, src, cosT, sinT, dst DeviceBuffer, batch, heads, seqLen, headDim int) error {
+	fn, err := b.getKernel(fnName)
+	if err != nil {
+		return err
+	}
+	// PTX param order: p_dst, p_src, p_cos, p_sin, p_seq_len, p_head_dim, p_num_heads.
+	vs, vco, vsi, vd := src.deviceBuffer(), cosT.deviceBuffer(), sinT.deviceBuffer(), dst.deviceBuffer()
+	args := struct {
+		dst     uintptr
+		src     uintptr
+		cosT    uintptr
+		sinT    uintptr
+		seqLen  int32
+		headDim int32
+		heads   int32
+	}{vd.ptr, vs.ptr, vco.ptr, vsi.ptr, int32(seqLen), int32(headDim), int32(heads)}
+	params := [7]unsafe.Pointer{
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.cosT),
+		unsafe.Pointer(&args.sinT),
+		unsafe.Pointer(&args.seqLen),
+		unsafe.Pointer(&args.headDim),
+		unsafe.Pointer(&args.heads),
+	}
+	gridX := uint32(batch * heads * seqLen)
+	blockX := b.ropeBlockDim(headDim)
+	if r := cuLaunchKernel(fn, gridX, 1, 1, blockX, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) RoPEF32(x, out DeviceBuffer, batch, heads, seqLen, headDim int, base float32) error {
+	if batch <= 0 || heads <= 0 || seqLen <= 0 || headDim <= 0 || headDim%2 != 0 {
+		return fmt.Errorf("cuda.RoPEF32: batch/heads/seqLen/headDim must be > 0 and headDim even")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRoPEF32("rope_f32", x, out, batch, heads, seqLen, headDim, base)
+}
+
+func (b *PuregoBackend) RoPEGradF32(dy, dx DeviceBuffer, batch, heads, seqLen, headDim int, base float32) error {
+	if batch <= 0 || heads <= 0 || seqLen <= 0 || headDim <= 0 || headDim%2 != 0 {
+		return fmt.Errorf("cuda.RoPEGradF32: dims must be > 0 and headDim even")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRoPEF32("rope_grad_f32", dy, dx, batch, heads, seqLen, headDim, base)
+}
+
+func (b *PuregoBackend) RoPEF64(x, cosTable, sinTable, out DeviceBuffer, batch, heads, seqLen, headDim int) error {
+	if batch <= 0 || heads <= 0 || seqLen <= 0 || headDim <= 0 || headDim%2 != 0 {
+		return fmt.Errorf("cuda.RoPEF64: dims must be > 0 and headDim even")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRoPEF64("rope_f64", x, cosTable, sinTable, out, batch, heads, seqLen, headDim)
+}
+
+func (b *PuregoBackend) RoPEGradF64(dy, cosTable, sinTable, dx DeviceBuffer, batch, heads, seqLen, headDim int) error {
+	if batch <= 0 || heads <= 0 || seqLen <= 0 || headDim <= 0 || headDim%2 != 0 {
+		return fmt.Errorf("cuda.RoPEGradF64: dims must be > 0 and headDim even")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchRoPEF64("rope_grad_f64", dy, cosTable, sinTable, dx, batch, heads, seqLen, headDim)
 }
 
 // ──────────────────────────────────────────────────────────

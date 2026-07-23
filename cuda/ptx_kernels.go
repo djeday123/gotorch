@@ -2367,6 +2367,326 @@ $Lembg_f64_loop:
 $Lembg_f64_end:
     ret;
 }
+
+// ================================================================
+// P4-ROPE: Rotary Positional Embedding forward + backward, F32 (on-the-fly
+// sin/cos.approx.f32) and F64 (host-precomputed cos/sin tables).
+//
+// Contract:
+//   x, out: [batch, heads, seqLen, headDim] row-major, F32 or F64.
+//   Half-layout pairs: (x[i], x[i+half]) where half=headDim/2. NOT (2i, 2i+1).
+//   Forward formula:
+//     angle = pos * base^(-2i/headDim)
+//     dst[i]      = src[i]*cos - src[i+half]*sin
+//     dst[i+half] = src[i]*sin + src[i+half]*cos
+//   Backward formula (rotation by minus-angle):
+//     dx[i]      = dy[i]*cos + dy[i+half]*sin
+//     dx[i+half] = -dy[i]*sin + dy[i+half]*cos
+//
+// F32-kernel: sin/cos via .approx (matches goml.cuda.rope_f32 -> bit-exact).
+// F64-kernel: cos/sin loaded from host-precomputed tables [seqLen, half] F64.
+//   Rationale for tables: fdlibm F64 sin/cos = 200+ PTX lines, error-prone;
+//   table O(sl*halfDim*8) = ~4MB at sl=8192/hd=128 -- acceptable.
+//   Judge floor <=1e-12 held via host math.Cos/math.Sin (1 ulp F64).
+// ================================================================
+
+// rope_f32: bit-exact copy of goml.backend.cuda rope_f32 (kernels.go:314).
+.visible .entry rope_f32(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u32 p_seq_len,
+    .param .u32 p_head_dim,
+    .param .u32 p_num_heads,
+    .param .f32 p_base
+) {
+    .reg .u32 %tidx, %bidx, %half_dim, %seq_len, %head_dim, %pos;
+    .reg .u32 %off0, %off1;
+    .reg .u64 %dst, %src, %addr;
+    .reg .f32 %base, %freq, %angle, %cos_v, %sin_v;
+    .reg .f32 %x0, %x1, %r0, %r1, %t0, %t1;
+    .reg .f32 %fi, %fdim, %two;
+    .reg .pred %p;
+
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %src, [p_src];
+    ld.param.u32 %seq_len, [p_seq_len];
+    ld.param.u32 %head_dim, [p_head_dim];
+    ld.param.f32 %base, [p_base];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+
+    shr.u32 %half_dim, %head_dim, 1;
+    setp.ge.u32 %p, %tidx, %half_dim;
+    @%p bra $L_rope_f32_done;
+
+    rem.u32 %pos, %bidx, %seq_len;
+
+    cvt.rn.f32.u32 %fi, %tidx;
+    cvt.rn.f32.u32 %fdim, %head_dim;
+    mov.f32 %two, 0f40000000;
+    mul.f32 %freq, %fi, %two;
+    div.approx.f32 %freq, %freq, %fdim;
+    lg2.approx.f32 %t0, %base;
+    mul.f32 %freq, %freq, %t0;
+    neg.f32 %freq, %freq;
+    ex2.approx.f32 %freq, %freq;
+
+    cvt.rn.f32.u32 %angle, %pos;
+    mul.f32 %angle, %angle, %freq;
+
+    sin.approx.f32 %sin_v, %angle;
+    cos.approx.f32 %cos_v, %angle;
+
+    mul.lo.u32 %off0, %bidx, %head_dim;
+    add.u32 %off0, %off0, %tidx;
+    add.u32 %off1, %off0, %half_dim;
+
+    mul.wide.u32 %addr, %off0, 4;
+    add.u64 %addr, %src, %addr;
+    ld.global.f32 %x0, [%addr];
+    mul.wide.u32 %addr, %off1, 4;
+    add.u64 %addr, %src, %addr;
+    ld.global.f32 %x1, [%addr];
+
+    mul.f32 %t0, %x0, %cos_v;
+    mul.f32 %t1, %x1, %sin_v;
+    sub.f32 %r0, %t0, %t1;
+    mul.f32 %t0, %x0, %sin_v;
+    mul.f32 %t1, %x1, %cos_v;
+    add.f32 %r1, %t0, %t1;
+
+    mul.wide.u32 %addr, %off0, 4;
+    add.u64 %addr, %dst, %addr;
+    st.global.f32 [%addr], %r0;
+    mul.wide.u32 %addr, %off1, 4;
+    add.u64 %addr, %dst, %addr;
+    st.global.f32 [%addr], %r1;
+$L_rope_f32_done:
+    ret;
+}
+
+// rope_grad_f32: rotation by minus-angle.
+// dx[i]      = dy[i]*cos + dy[i+half]*sin
+// dx[i+half] = -dy[i]*sin + dy[i+half]*cos
+.visible .entry rope_grad_f32(
+    .param .u64 p_dx,
+    .param .u64 p_dy,
+    .param .u32 p_seq_len,
+    .param .u32 p_head_dim,
+    .param .u32 p_num_heads,
+    .param .f32 p_base
+) {
+    .reg .u32 %tidx, %bidx, %half_dim, %seq_len, %head_dim, %pos;
+    .reg .u32 %off0, %off1;
+    .reg .u64 %dx, %dy, %addr;
+    .reg .f32 %base, %freq, %angle, %cos_v, %sin_v;
+    .reg .f32 %y0, %y1, %r0, %r1, %t0, %t1;
+    .reg .f32 %fi, %fdim, %two;
+    .reg .pred %p;
+
+    ld.param.u64 %dx, [p_dx];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u32 %seq_len, [p_seq_len];
+    ld.param.u32 %head_dim, [p_head_dim];
+    ld.param.f32 %base, [p_base];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+
+    shr.u32 %half_dim, %head_dim, 1;
+    setp.ge.u32 %p, %tidx, %half_dim;
+    @%p bra $L_rope_grad_f32_done;
+
+    rem.u32 %pos, %bidx, %seq_len;
+
+    cvt.rn.f32.u32 %fi, %tidx;
+    cvt.rn.f32.u32 %fdim, %head_dim;
+    mov.f32 %two, 0f40000000;
+    mul.f32 %freq, %fi, %two;
+    div.approx.f32 %freq, %freq, %fdim;
+    lg2.approx.f32 %t0, %base;
+    mul.f32 %freq, %freq, %t0;
+    neg.f32 %freq, %freq;
+    ex2.approx.f32 %freq, %freq;
+
+    cvt.rn.f32.u32 %angle, %pos;
+    mul.f32 %angle, %angle, %freq;
+
+    sin.approx.f32 %sin_v, %angle;
+    cos.approx.f32 %cos_v, %angle;
+
+    mul.lo.u32 %off0, %bidx, %head_dim;
+    add.u32 %off0, %off0, %tidx;
+    add.u32 %off1, %off0, %half_dim;
+
+    mul.wide.u32 %addr, %off0, 4;
+    add.u64 %addr, %dy, %addr;
+    ld.global.f32 %y0, [%addr];
+    mul.wide.u32 %addr, %off1, 4;
+    add.u64 %addr, %dy, %addr;
+    ld.global.f32 %y1, [%addr];
+
+    // dx[i] = y0*cos + y1*sin
+    mul.f32 %t0, %y0, %cos_v;
+    mul.f32 %t1, %y1, %sin_v;
+    add.f32 %r0, %t0, %t1;
+    // dx[i+half] = -y0*sin + y1*cos
+    mul.f32 %t0, %y0, %sin_v;
+    mul.f32 %t1, %y1, %cos_v;
+    sub.f32 %r1, %t1, %t0;
+
+    mul.wide.u32 %addr, %off0, 4;
+    add.u64 %addr, %dx, %addr;
+    st.global.f32 [%addr], %r0;
+    mul.wide.u32 %addr, %off1, 4;
+    add.u64 %addr, %dx, %addr;
+    st.global.f32 [%addr], %r1;
+$L_rope_grad_f32_done:
+    ret;
+}
+
+// rope_f64: cos/sin loaded from host-precomputed tables [seqLen, half_dim] F64.
+// Delivers F64 accuracy 1 ulp (host math.Cos/Sin).
+.visible .entry rope_f64(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u64 p_cos,
+    .param .u64 p_sin,
+    .param .u32 p_seq_len,
+    .param .u32 p_head_dim,
+    .param .u32 p_num_heads
+) {
+    .reg .u32 %tidx, %bidx, %half_dim, %seq_len, %head_dim, %pos;
+    .reg .u32 %off0, %off1, %tblOff;
+    .reg .u64 %dst, %src, %cos_p, %sin_p, %addr;
+    .reg .f64 %x0, %x1, %r0, %r1, %cos_v, %sin_v, %t0, %t1;
+    .reg .pred %p;
+
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %cos_p, [p_cos];
+    ld.param.u64 %sin_p, [p_sin];
+    ld.param.u32 %seq_len, [p_seq_len];
+    ld.param.u32 %head_dim, [p_head_dim];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+
+    shr.u32 %half_dim, %head_dim, 1;
+    setp.ge.u32 %p, %tidx, %half_dim;
+    @%p bra $L_rope_f64_done;
+
+    rem.u32 %pos, %bidx, %seq_len;
+
+    // Table offset = pos * half_dim + tid
+    mul.lo.u32 %tblOff, %pos, %half_dim;
+    add.u32 %tblOff, %tblOff, %tidx;
+    mul.wide.u32 %addr, %tblOff, 8;
+    add.u64 %addr, %cos_p, %addr;
+    ld.global.f64 %cos_v, [%addr];
+    mul.wide.u32 %addr, %tblOff, 8;
+    add.u64 %addr, %sin_p, %addr;
+    ld.global.f64 %sin_v, [%addr];
+
+    mul.lo.u32 %off0, %bidx, %head_dim;
+    add.u32 %off0, %off0, %tidx;
+    add.u32 %off1, %off0, %half_dim;
+
+    mul.wide.u32 %addr, %off0, 8;
+    add.u64 %addr, %src, %addr;
+    ld.global.f64 %x0, [%addr];
+    mul.wide.u32 %addr, %off1, 8;
+    add.u64 %addr, %src, %addr;
+    ld.global.f64 %x1, [%addr];
+
+    mul.f64 %t0, %x0, %cos_v;
+    mul.f64 %t1, %x1, %sin_v;
+    sub.f64 %r0, %t0, %t1;
+    mul.f64 %t0, %x0, %sin_v;
+    mul.f64 %t1, %x1, %cos_v;
+    add.f64 %r1, %t0, %t1;
+
+    mul.wide.u32 %addr, %off0, 8;
+    add.u64 %addr, %dst, %addr;
+    st.global.f64 [%addr], %r0;
+    mul.wide.u32 %addr, %off1, 8;
+    add.u64 %addr, %dst, %addr;
+    st.global.f64 [%addr], %r1;
+$L_rope_f64_done:
+    ret;
+}
+
+// rope_grad_f64: backward via host cos/sin tables.
+.visible .entry rope_grad_f64(
+    .param .u64 p_dx,
+    .param .u64 p_dy,
+    .param .u64 p_cos,
+    .param .u64 p_sin,
+    .param .u32 p_seq_len,
+    .param .u32 p_head_dim,
+    .param .u32 p_num_heads
+) {
+    .reg .u32 %tidx, %bidx, %half_dim, %seq_len, %head_dim, %pos;
+    .reg .u32 %off0, %off1, %tblOff;
+    .reg .u64 %dx, %dy, %cos_p, %sin_p, %addr;
+    .reg .f64 %y0, %y1, %r0, %r1, %cos_v, %sin_v, %t0, %t1;
+    .reg .pred %p;
+
+    ld.param.u64 %dx, [p_dx];
+    ld.param.u64 %dy, [p_dy];
+    ld.param.u64 %cos_p, [p_cos];
+    ld.param.u64 %sin_p, [p_sin];
+    ld.param.u32 %seq_len, [p_seq_len];
+    ld.param.u32 %head_dim, [p_head_dim];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+
+    shr.u32 %half_dim, %head_dim, 1;
+    setp.ge.u32 %p, %tidx, %half_dim;
+    @%p bra $L_rope_grad_f64_done;
+
+    rem.u32 %pos, %bidx, %seq_len;
+
+    mul.lo.u32 %tblOff, %pos, %half_dim;
+    add.u32 %tblOff, %tblOff, %tidx;
+    mul.wide.u32 %addr, %tblOff, 8;
+    add.u64 %addr, %cos_p, %addr;
+    ld.global.f64 %cos_v, [%addr];
+    mul.wide.u32 %addr, %tblOff, 8;
+    add.u64 %addr, %sin_p, %addr;
+    ld.global.f64 %sin_v, [%addr];
+
+    mul.lo.u32 %off0, %bidx, %head_dim;
+    add.u32 %off0, %off0, %tidx;
+    add.u32 %off1, %off0, %half_dim;
+
+    mul.wide.u32 %addr, %off0, 8;
+    add.u64 %addr, %dy, %addr;
+    ld.global.f64 %y0, [%addr];
+    mul.wide.u32 %addr, %off1, 8;
+    add.u64 %addr, %dy, %addr;
+    ld.global.f64 %y1, [%addr];
+
+    // dx[i] = y0*cos + y1*sin
+    mul.f64 %t0, %y0, %cos_v;
+    mul.f64 %t1, %y1, %sin_v;
+    add.f64 %r0, %t0, %t1;
+    // dx[i+half] = -y0*sin + y1*cos
+    mul.f64 %t0, %y0, %sin_v;
+    mul.f64 %t1, %y1, %cos_v;
+    sub.f64 %r1, %t1, %t0;
+
+    mul.wide.u32 %addr, %off0, 8;
+    add.u64 %addr, %dx, %addr;
+    st.global.f64 [%addr], %r0;
+    mul.wide.u32 %addr, %off1, 8;
+    add.u64 %addr, %dx, %addr;
+    st.global.f64 [%addr], %r1;
+$L_rope_grad_f64_done:
+    ret;
+}
 `
 // END-OF-STAGE-5-DISABLED-BLOCK-BELOW
 var _ = `
