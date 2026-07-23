@@ -2,7 +2,7 @@
 
 **Дата:** 2026-07-22
 **Итог:** ✅ ПРОЙДЕН. Форма ports для главы (Embedding/RoPE/batched MatMul) закрыта. F32/F64 fwd+bwd работают с запасом **200-2000×** vs pre-registered floor.
-**Побочная находка:** goml.cuda.RMSNorm — FP16 dlopen orphan (0 callers, `transformer_kernels.go:45`), поэтому port через gotorch = единственный **живой** RMSNorm F32/F64 в repo.
+**Побочная находка:** goml.cuda.RMSNorm — FP16 dlopen с 0 вызывающих на 2026-07-22 (`transformer_kernels.go:45`). **Законсервировано, не удаляется** (прецедент `libgotorch_cuda.so`): выстраданное рабочее ядро, потенциал — FP16-эпоха портирования. Порт через gotorch = единственный **живой** RMSNorm F32/F64 в repo на текущий момент.
 
 ---
 
@@ -182,9 +182,9 @@ Verdict: **WITHIN honest tolerance** (thermal), не задача P2 sinks.
 
 ## Побочные находки
 
-1. **legacy-cleanup candidate #1: `goml/backend/cuda/transformer_kernels.go:45` `RMSNorm`** — FP16 dlopen orphan (0 callers, единственное определение). Legacy-эталон оказался памятником; gotorch-версия единственная живая. Глава портирования будет пополнять список кандидатов; финальная уборка — по списку после закрытия главы.
+1. **Legacy inventory запись #1 (законсервированные): `goml/backend/cuda/transformer_kernels.go:45` `RMSNorm`** — FP16 dlopen, 0 вызывающих на 2026-07-22 (grep `RMSNorm|rmsnorm` = единственное определение). **Не удаляется** — прецедент `libgotorch_cuda.so`: выстраданное ядро остаётся как задел. Потенциал — FP16-эпоха портирования (mixed-precision inference / trained-in-FP16 модели): готовое ptxas-компилируемое ядро с известной точностью, можно включить через FP16 dispatch в adapter'е. Инвентарь — карта задела, не список на снос; роль — приоритизация будущих портов (живые первыми).
 2. **`libcublaslt_wrapper.so` missing** на текущей машине (`WARN: cuBLASLt wrapper not found`) — не блокирует P2 (RMSNorm не идёт через cuBLASLt). Возможно триггер для отдельной задачи для FP8 workflow'ов.
-3. **PTX rule #1 (ASCII) — диагностика окупилась вторым срабатыванием.** JIT-log с error-buffer поймал em-dash в комментарии за секунды вместо бисекта JIT_COMPILER_ERROR. Первый срабатывание — R02b (закладка правил); второе — здесь. 6 правил работают как safety net на реальных инцидентах, не только на бумаге.
+3. **PTX rule #1 (ASCII) — диагностика окупилась вторым срабатыванием.** JIT-log с error-buffer поймал em-dash в комментарии за секунды вместо бисекта JIT_COMPILER_ERROR. Первое срабатывание — R02b (закладка правил); второе — здесь. 6 правил работают как safety net на реальных инцидентах, не только на бумаге.
 
 ---
 
