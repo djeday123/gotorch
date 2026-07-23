@@ -893,3 +893,56 @@ func (b *PuregoBackend) MatMulF32(a, bb, c DeviceBuffer, m, n, k int) error {
 	}
 	return nil
 }
+
+// MatMulF32_TF32 — F32 GEMM с точечным включением TF32-tensor-cores.
+// R03b-impl-4-final: назначение — (1) сверка с legacy-путями, у которых
+// cublas handle глобально в TF32 (goml.cuda), (2) первый кирпич будущего
+// скоростного слоя для случаев где 1e-3 rel-точность достаточна.
+//
+// Философия: TF32 — свойство МЕТОДА, не состояние backend'а. Внутри метода
+// SetMathMode(TF32) → Sgemm → defer возврат в DEFAULT_MATH до return.
+// Невозможно "забыть выключить" — режим не выходит наружу от вызова.
+//
+// Точность: rel ~ 1e-3 против MatMulF32 (~FP32 eps). Bit-exact с MatMulF32
+// НЕ ожидается — TF32 использует 10-bit mantissa в FMA vs 23-bit FP32.
+// Если тест показал bit-exact MatMulF32 vs MatMulF32_TF32 — TF32 не
+// включился (Sgemm игнорирует math mode на этой карте/драйвере), это баг.
+func (b *PuregoBackend) MatMulF32_TF32(a, bb, c DeviceBuffer, m, n, k int) error {
+	if m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulF32_TF32: m/n/k must be > 0, got %d/%d/%d", m, n, k)
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	// Включаем TF32 tensor-op math перед Sgemm; гарантированно возвращаем
+	// DEFAULT_MATH до return метода. defer + inline func — стандартный Go
+	// pattern для "ресурс с обязательным rollback'ом".
+	if s := cublasSetMathMode(b.cublas, CUBLAS_TF32_TENSOR_OP_MATH); s != CUBLAS_STATUS_SUCCESS {
+		return fmt.Errorf("cublasSetMathMode(TF32): %s", s.Error())
+	}
+	defer func() {
+		// Никогда не игнорируем — если rollback fail, cublas handle
+		// оказался в TF32-состоянии; следующий MatMulF32 даст неверную
+		// точность. Паникуем — это лучше чем тихий переход в TF32.
+		if s := cublasSetMathMode(b.cublas, CUBLAS_DEFAULT_MATH); s != CUBLAS_STATUS_SUCCESS {
+			panic(fmt.Sprintf("cuda.MatMulF32_TF32: rollback SetMathMode(DEFAULT) failed: %s", s.Error()))
+		}
+	}()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+	s := cublasSgemm_v2(
+		b.cublas,
+		CUBLAS_OP_N, CUBLAS_OP_N,
+		int32(n), int32(m), int32(k),
+		unsafe.Pointer(&alpha),
+		vb.ptr, int32(n),
+		va.ptr, int32(k),
+		unsafe.Pointer(&beta),
+		vc.ptr, int32(n),
+	)
+	if s != CUBLAS_STATUS_SUCCESS {
+		return fmt.Errorf("cublasSgemm_v2 (TF32): %s", s.Error())
+	}
+	return nil
+}

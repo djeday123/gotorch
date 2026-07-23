@@ -194,6 +194,12 @@ type Backend interface {
 
 	MatMulF64(a, b, c DeviceBuffer, m, n, k int) error
 	MatMulF32(a, b, c DeviceBuffer, m, n, k int) error
+
+	// MatMulF32_TF32 — F32 GEMM с точечным включением TF32-tensor-cores.
+	// Точность rel ~1e-3 против MatMulF32 (~FP32 eps). Bit-exact НЕ ожидается —
+	// TF32 использует 10-bit mantissa в FMA. Назначение: сверка с legacy-путями,
+	// у которых cublas handle глобально в TF32. См. R03b_design.md impl-4-final.
+	MatMulF32_TF32(a, b, c DeviceBuffer, m, n, k int) error
 }
 
 // NewBackend возвращает purego-backend, привязанный к устройству device.

@@ -4,9 +4,13 @@ package cuda
 // Create/Destroy/SetStream + Dgemm/Sgemm. GemmEx, batched-варианты, TF32
 // math mode — вне этого этапа: не тащим для чистоты и минимизации surface.
 //
-// TF32 умышленно НЕ включаем: без cublasSetMathMode default = FULL FP32,
-// что даёт допуск ~1e-5 на F32 (заявленный в Воротах 2). TF32 срезал бы
-// точность до ~1e-3, требуя ослабления допуска.
+// Handle-глобальный TF32-mode умышленно НЕ включаем: без cublasSetMathMode
+// default = FULL FP32, что даёт допуск ~1e-5 на F32 (заявленный в Воротах 2).
+// TF32-как-состояние срезал бы точность до ~1e-3, требуя ослабления допуска.
+// R03b-impl-4-final: точечный per-call TF32 доступен через MatMulF32_TF32 —
+// SetMathMode(TF32) внутри метода, defer возврат в DEFAULT_MATH до return.
+// Философия dtype-суффиксов R02a: режим — свойство метода, не состояние
+// backend'а; невозможно «забыть выключить» то, что не включается глобально.
 //
 // uintptr в сигнатурах биндингов легален — конверсия из unsafe.Pointer
 // происходит в момент вызова (unsafe.Pointer rule 4 про syscall-подобные
@@ -55,6 +59,12 @@ const (
 	CUBLAS_OP_T cublasOperation = 1
 )
 
+// cublasMath_t (для точечного TF32 через MatMulF32_TF32).
+const (
+	CUBLAS_DEFAULT_MATH        int32 = 0
+	CUBLAS_TF32_TENSOR_OP_MATH int32 = 3
+)
+
 var (
 	cublasOnce sync.Once
 	cublasErr  error
@@ -62,6 +72,7 @@ var (
 	cublasCreate_v2    func(handle *uintptr) cublasStatus
 	cublasDestroy_v2   func(handle uintptr) cublasStatus
 	cublasSetStream_v2 func(handle uintptr, stream uintptr) cublasStatus
+	cublasSetMathMode  func(handle uintptr, mode int32) cublasStatus
 
 	cublasDgemm_v2 func(
 		handle uintptr,
@@ -101,6 +112,7 @@ func initCuBLAS() error {
 		purego.RegisterLibFunc(&cublasCreate_v2, lib, "cublasCreate_v2")
 		purego.RegisterLibFunc(&cublasDestroy_v2, lib, "cublasDestroy_v2")
 		purego.RegisterLibFunc(&cublasSetStream_v2, lib, "cublasSetStream_v2")
+		purego.RegisterLibFunc(&cublasSetMathMode, lib, "cublasSetMathMode")
 		purego.RegisterLibFunc(&cublasDgemm_v2, lib, "cublasDgemm_v2")
 		purego.RegisterLibFunc(&cublasSgemm_v2, lib, "cublasSgemm_v2")
 	})
