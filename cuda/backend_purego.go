@@ -1595,19 +1595,13 @@ func (b *PuregoBackend) MatMulF32_TF32(a, bb, c DeviceBuffer, m, n, k int) error
 // vs goml на A/B тестах при одном math mode.
 // ──────────────────────────────────────────────────────────
 
-func (b *PuregoBackend) MatMulStridedBatchedF32(a, bb, c DeviceBuffer,
+// matMulBatchedF32Loop -- fallback loop path (используется когда wrapper .so отсутствует).
+// Тот же паттерн что goml BatchedMatMulF32 (loop cublasSgemm_v2).
+func (b *PuregoBackend) matMulBatchedF32Loop(a, bb, c DeviceBuffer,
 	batch, m, n, k int,
 	strideA, strideB, strideC int64) error {
-	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
-		return fmt.Errorf("cuda.MatMulStridedBatchedF32: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
-	}
-	if err := b.bind(); err != nil {
-		return err
-	}
-	defer runtime.UnlockOSThread()
 	alpha, beta := float32(1.0), float32(0.0)
 	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
-	// Страйды -- в элементах; в байтах для указателя = stride * sizeof(f32) = *4.
 	sA := uintptr(strideA) * 4
 	sB := uintptr(strideB) * 4
 	sC := uintptr(strideC) * 4
@@ -1623,22 +1617,15 @@ func (b *PuregoBackend) MatMulStridedBatchedF32(a, bb, c DeviceBuffer,
 			vc.ptr+sC*uintptr(i), int32(n),
 		)
 		if s != CUBLAS_STATUS_SUCCESS {
-			return fmt.Errorf("cublasSgemm_v2 batch=%d/%d: %s", i, batch, s.Error())
+			return fmt.Errorf("cublasSgemm_v2 batch=%d/%d (loop-fallback): %s", i, batch, s.Error())
 		}
 	}
 	return nil
 }
 
-func (b *PuregoBackend) MatMulStridedBatchedF64(a, bb, c DeviceBuffer,
+func (b *PuregoBackend) matMulBatchedF64Loop(a, bb, c DeviceBuffer,
 	batch, m, n, k int,
 	strideA, strideB, strideC int64) error {
-	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
-		return fmt.Errorf("cuda.MatMulStridedBatchedF64: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
-	}
-	if err := b.bind(); err != nil {
-		return err
-	}
-	defer runtime.UnlockOSThread()
 	alpha, beta := float64(1.0), float64(0.0)
 	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
 	sA := uintptr(strideA) * 8
@@ -1656,8 +1643,79 @@ func (b *PuregoBackend) MatMulStridedBatchedF64(a, bb, c DeviceBuffer,
 			vc.ptr+sC*uintptr(i), int32(n),
 		)
 		if s != CUBLAS_STATUS_SUCCESS {
-			return fmt.Errorf("cublasDgemm_v2 batch=%d/%d: %s", i, batch, s.Error())
+			return fmt.Errorf("cublasDgemm_v2 batch=%d/%d (loop-fallback): %s", i, batch, s.Error())
 		}
 	}
 	return nil
+}
+
+func (b *PuregoBackend) MatMulStridedBatchedF32(a, bb, c DeviceBuffer,
+	batch, m, n, k int,
+	strideA, strideB, strideC int64) error {
+	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF32: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+
+	// Native path через wrapper .so если доступен (industrial default).
+	if HasBlasWrapper() {
+		alpha, beta := float32(1.0), float32(0.0)
+		va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+		// cuBLAS column-major: даём (B,A,C) с M=N,N=M чтобы получить row-major C=A@B.
+		args := SgemmStridedBatchedArgs{
+			Stream:  b.stream,
+			TransA:  int32(CUBLAS_OP_N), TransB: int32(CUBLAS_OP_N),
+			M:  int32(n), N: int32(m), K: int32(k),
+			Alpha: unsafe.Pointer(&alpha),
+			A:     vb.ptr, Lda: int32(n), StrideA: strideB,
+			B:     va.ptr, Ldb: int32(k), StrideB: strideA,
+			Beta:  unsafe.Pointer(&beta),
+			C:     vc.ptr, Ldc: int32(n), StrideC: strideC,
+			Batch: int32(batch),
+		}
+		st := gtSgemmStridedBatched(unsafe.Pointer(&args))
+		if st != int32(CUBLAS_STATUS_SUCCESS) {
+			return fmt.Errorf("gt_sgemm_strided_batched: %s", cublasStatus(st).Error())
+		}
+		return nil
+	}
+	// Fallback: loop cublasSgemm_v2 (тот же паттерн что goml BatchedMatMulF32).
+	return b.matMulBatchedF32Loop(a, bb, c, batch, m, n, k, strideA, strideB, strideC)
+}
+
+func (b *PuregoBackend) MatMulStridedBatchedF64(a, bb, c DeviceBuffer,
+	batch, m, n, k int,
+	strideA, strideB, strideC int64) error {
+	if batch <= 0 || m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulStridedBatchedF64: batch/m/n/k must be > 0, got %d/%d/%d/%d", batch, m, n, k)
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+
+	if HasBlasWrapper() {
+		alpha, beta := float64(1.0), float64(0.0)
+		va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+		args := DgemmStridedBatchedArgs{
+			Stream:  b.stream,
+			TransA:  int32(CUBLAS_OP_N), TransB: int32(CUBLAS_OP_N),
+			M:  int32(n), N: int32(m), K: int32(k),
+			Alpha: unsafe.Pointer(&alpha),
+			A:     vb.ptr, Lda: int32(n), StrideA: strideB,
+			B:     va.ptr, Ldb: int32(k), StrideB: strideA,
+			Beta:  unsafe.Pointer(&beta),
+			C:     vc.ptr, Ldc: int32(n), StrideC: strideC,
+			Batch: int32(batch),
+		}
+		st := gtDgemmStridedBatched(unsafe.Pointer(&args))
+		if st != int32(CUBLAS_STATUS_SUCCESS) {
+			return fmt.Errorf("gt_dgemm_strided_batched: %s", cublasStatus(st).Error())
+		}
+		return nil
+	}
+	return b.matMulBatchedF64Loop(a, bb, c, batch, m, n, k, strideA, strideB, strideC)
 }

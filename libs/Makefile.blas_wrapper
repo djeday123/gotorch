@@ -1,0 +1,37 @@
+# libgotorch_blas_wrapper.so — thin cuBLAS wrapper for purego binding.
+# See blas_wrapper.c for rationale (purego v0.9.1 <18 args limit).
+#
+# Build:
+#   make -f Makefile.blas_wrapper
+# Or from repo root:
+#   make -C libs -f Makefile.blas_wrapper
+#
+# Runtime resolution: adapter/loader searches (in order):
+#   1. $GOTORCH_LIBS_DIR/libgotorch_blas_wrapper.so
+#   2. ./libgotorch_blas_wrapper.so
+#   3. libgotorch_blas_wrapper.so (via ldconfig cache)
+# Missing .so => loop-fallback in Go (soft degradation with warning).
+
+CUDA_HOME ?= /usr/local/cuda
+CC        ?= gcc
+OUT        = libgotorch_blas_wrapper.so
+SRC        = blas_wrapper.c
+
+CFLAGS   = -O2 -fPIC -Wall
+INCLUDES = -I$(CUDA_HOME)/include
+LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcublas
+
+.PHONY: all clean check
+
+all: $(OUT)
+
+$(OUT): $(SRC)
+	$(CC) -shared $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+	@ls -la $@
+
+clean:
+	@rm -f $(OUT)
+
+check: $(OUT)
+	@nm -D $(OUT) | grep -E "gt_(sgemm|dgemm|gemm_ex|gemm_strided)"
