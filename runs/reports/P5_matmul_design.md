@@ -28,7 +28,7 @@ Grep MatMul в goml по всем 4 уровням (backend interface / cuda imp
 | `goml/backend/cuda/cublas.go:397-403` | `BatchedMatMulF16` | wrapper `cublasGemmStridedBatchedEx`, FP16 IO |
 | `goml/backend/cuda/cublas_fp8.go:64-86` | `MatMulF8E4M3` | wrapper `libcublaslt_wrapper.so::fp8_matmul_wrapper` — cuBLASLt cached workspace |
 | `goml/backend/cuda/cublas_fp8.go:88-90` | `MatMulF8E5M2` | **не реализовано** (returns error) |
-| `goml/backend/cuda/fp8_gemm.go` | `fp8gemm.gemm/original/ss` | dlopen `libfp8gemm.so` — свои PTX FP8 kernel'ы, R2/FA-research |
+| `goml/backend/cuda/fp8_gemm.go` | `fp8gemm.gemm/original/ss` (Go: `FP8GEMMSinglesync`) | dlopen `libfp8gemm.so` — **законсервированное production sm_89 FP8 GEMM ядро**. Dual-mode (`original` + `singlesync`), XOR-swizzle, корректность-гейты пройдены. Прецедент: **587 TFLOPS @ 89% пика на RTX 4090 OC**, **1.78× быстрее cublasLt** (330-346T на тех же формах). **НЕ портировано на sm_120a** — статус консервы «доказанная альтернатива прошлого поколения», не «черновик». |
 
 ### B1.3 Callers боевого пути (nn/cmd)
 
@@ -40,7 +40,7 @@ Grep MatMul в goml по всем 4 уровням (backend interface / cuda imp
 | `goml/nn/attention.go:65-89` | 4×`Linear.Forward` для Q/K/V/O проекций | `[batch, seqLen, dim]` × `[dim, dim]` |
 | `goml/nn/backward.go` | `Linear.Backward` (nn.LLM training path) | `[batch·seq, dim]` — CPU F32 путь через weights.Grad |
 | **`goml/cmd/fp16bench/main.go:186-205`** | `MatMulF16`, `MatMulF8E4M3` | **BENCH-ONLY**, не production; полигон производительности |
-| `goml/cmd/fa_v121r_diet` (`runs/`) | fp8_gemm через libfp8gemm | **R2/FA-research**, не production |
+| `goml/cmd/fa_v121r_diet` (`runs/`) | fp8_gemm через libfp8gemm | вспомогательные вызовы из FA-серии; **само libfp8gemm ядро — production sm_89 с сертификацией**, а не research (см. B1.2) |
 
 ### B1.4 Живое / законсервированное
 
@@ -50,7 +50,7 @@ Grep MatMul в goml по всем 4 уровням (backend interface / cuda imp
 **Законсервированное (workflowы существуют, но НЕ в production trainer'е):**
 - `cublas.MatMulF16` + `BatchedMatMulF16` — работают, вызываются только `fp16bench`. Полностью рабочая инфраструктура: `libcublas_wrapper.so` уже собран, biэксэкт vs cublasGemmEx.
 - `cublas_fp8.MatMulF8E4M3` — работает, вызывается `fp16bench`. `libcublaslt_wrapper.so` уже собран. E5M2 не реализован.
-- `fp8_gemm.gemm` (свои PTX ядра, `libfp8gemm.so`) — R2/FA-research. Свободные FP8 GEMM без cuBLAS зависимости.
+- `fp8_gemm.gemm` (свои PTX ядра, `libfp8gemm.so`) — **законсервированное production sm_89 ядро** с корректностью-гейтами. Прецедент: 587T @ 89% пика на 4090, 1.78× cublasLt. Порт на sm_120a **отложен до якорного замера cublasLt на нашей карте** (см. B3, обязательное дополнение к B-impl-3).
 
 **Сироты, `libtransformer.so`:**
 - уже 2 записи в `[[legacy-inventory]]` (rmsnorm/rope FP16). MatMul-родственных нет (transformer.so не имеет MatMul).
@@ -152,10 +152,10 @@ QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error
 
 ### B3.1 Три варианта
 
-**(a) Свои PTX GEMM ядра.** По прецеденту goml `fp8_gemm.cu` (libfp8gemm) — реально возможно, работает в R2/FA-research.
-- Плюсы: полный контроль, никаких внешних `.so`, alpine-build остаётся clean (R02b правило alpine-no-CUDA).
-- Минусы: **не догнать cutlass/cuBLASLt** в GEMM. FA-серия достигла 647T fwd на hd=128 (63% of card peak) через недели multi-agent optimization. GEMM — та же задача, cutlass у NVIDIA годами тюнится; свои ядра дадут 30-50% от cuBLASLt.
-- Вывод: **отвергнуто** для production MatMul. Свои ядра оставить R2 area.
+**(a) Свои PTX GEMM ядра.** По прецеденту goml `libfp8gemm.so` — **производственно работающее sm_89 ядро** с сертификацией: 587 TFLOPS @ 89% пика на RTX 4090 OC, **1.78× быстрее cublasLt** (330-346T на тех же формах). Dual-mode, XOR-swizzle, gates пройдены. Go-биндинг существует.
+- Плюсы: полный контроль, никаких внешних `.so` (кроме своего), alpine-build clean; **доказанный обгон cublasLt на sm_89**.
+- Минусы: **на sm_120a НЕ портировано**; поведение не переносится между архитектурами (см. `[[feedback-peak-vs-real-workload]]`) — ни наши 89% на Ada, ни слабость cublasLt там же не гарантируют то же на Blackwell.
+- Вывод: **cublasLt — первый путь на sm_120a**; собственное ядро — задокументированная альтернатива прошлого поколения с прецедентом, решение о порте на sm_120a **откладывается до якорного замера cublasLt на нашей карте** (см. B6.3 обязательное добавление).
 
 **(b) cuBLASLt через purego-биндинги.** По прецеденту goml `libcublaslt_wrapper.so`.
 - Плюсы: полная скорость NVIDIA-optimized, поддержка FP8/FP16/BF16/TF32 из коробки, workspace-caching, algo-heuristic-selection. Батчи через cublasLtMatmul с matmul-descs.
@@ -170,10 +170,10 @@ QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error
 ### B3.2 Рекомендация
 
 **Вариант (c) — гибрид.**
-- F32 batched: purego `cublasSgemmStridedBatchedEx` — расширение существующего `cublas_purego.go`. Без .so-обёрток.
+- F32 batched: purego `cublasSgemmStridedBatched` — расширение существующего `cublas_purego.go`. Без .so-обёрток.
 - F16 non-batched: purego `cublasGemmEx` через cublas.so — не cublasLt (F16 работает в classic cublas).
 - F16 batched: purego `cublasGemmStridedBatchedEx`.
-- F8 E4M3: purego `cublasLtMatmul` через cublasLt.so + workspace-management.
+- F8 E4M3: purego `cublasLtMatmul` через cublasLt.so + workspace-management **как первый путь**; собственное ядро — задокументированная альтернатива с прецедентом sm_89 (см. B3.1(a)).
 
 **Обёртки `.so` не нужны.** goml использует C wrappers (`libcublas_wrapper.c`, `libcublaslt_wrapper.c`) из-за purego-ограничения на функции с >20 аргументами. **cublasGemmEx имеет 19 аргументов, cublasLtMatmul — 13.** purego support на 22.10+ поддерживает 20+ аргументов через `SetContext` ABI. Проверить экспериментально в первом impl-этапе; fallback = struct-args wrapper (как у goml).
 
@@ -292,7 +292,14 @@ QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error
 - A(goml.cuda libcublaslt_wrapper) vs B(gotorch cublasLt purego) — rel ≤ 1e-4.
 - Quantize amax + scale roundtrip: `QuantizeF32ToF8 → MatMul → CastF32ToF8*scaleC^-1` внутри hybrid tolerance.
 
-**Ворота:** регрессия + FA-canary + method count 72 → 75. **Alpine-graceful** (без libcublasLt.so.12 skip).
+**ОБЯЗАТЕЛЬНОЕ ДОБАВЛЕНИЕ — якорный бенч cublasLt-FP8 на sm_120a:**
+- 5-run wall-clock замер на боевых формах из **B1-инвентаря** (M/N/K из gputrain-shape + LLM-tiny + LLM-32k) плюс **8K-куб** (M=N=K=8192).
+- Число TFLOPS + %-от-card-peak (measured, не theoretical — см. `[[feedback-denominator-hygiene]]`).
+- Результат — **точка отсчёта в отчёте**. Без якоря утверждение «cublasLt достаточен» — вера, не факт.
+- **Закон главы, повторно записанный:** поведение не переносится между архитектурами. Ни 89% пика с sm_89 (libfp8gemm), ни слабость cublasLt там же (330-346T = 34%) не гарантируют то же на sm_120a. Только замер на нашей карте — доказательство.
+- Если якорный cublasLt < 50% пика — открывается вторая ветка: **порт libfp8gemm на sm_120a** отдельным ТЗ; решение — по числам.
+
+**Ворота:** регрессия + FA-canary + method count 72 → 75 + **якорный бенч в отчёт**. **Alpine-graceful** (без libcublasLt.so.12 skip).
 
 ### B6.4 B-impl-4: adapter стрелка + боевой Step
 
@@ -333,11 +340,14 @@ Method count финал: 66 → **75** (+9 methods за всю Часть B).
 
 ---
 
+## Решения по трём открытым вопросам (после ревью пользователя)
+
+1. **purego 20+ arg support для cublasGemmEx** — **пробный биндинг первым шагом B-impl-1**, до основного кода. Если purego упрётся в 19 аргументов → struct-args wrapper по прецеденту goml (`libcublas_wrapper.c`). Доложить фактом в отчёте B-impl-1, не гипотезой.
+2. **FP8 E5M2** — **out-of-scope**. Канон — e4m3. Возвращаемся, когда появится конкретный потребитель gradient-FP8 (сейчас нет).
+3. **gputrain на mixed-precision (F16)** — **строго ПОСЛЕ B-impl-4**. Порядок главы: инструмент сначала доказывается A/B-судьёй, потом идёт в бой. Никаких «параллельно с impl-2», никаких stub-callers.
+
 ## СТОП по правилу ТЗ
 
-Paper готов. **Ни строки кода не написано.** Жду ревью пользователя перед ТЗ B-impl-1.
+Paper готов, правки B1/B3 применены, три вопроса закрыты. **Ни строки production-кода не написано.**
 
-Открытые вопросы для обсуждения:
-- Экспериментальная проверка purego 20+ arg support для cublasGemmEx: делать до B-impl-2 или готовить struct-args wrapper заранее?
-- FP8 E5M2 в дорожную карту (сейчас out-of-scope) — когда именно возвращаемся?
-- gputrain-Step переключение на mixed-precision (F16 путь) — параллельно с B-impl-2 или после?
+Следующий шаг по ТЗ: **B-impl-1** — F32 batched (`cublasSgemmStridedBatched` + `cublasDgemmStridedBatched` для судьи) + **purego-проба cublasGemmEx первым шагом**. Ворота стандартные.
