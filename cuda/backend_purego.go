@@ -140,6 +140,9 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		// P2-RMS: RMSNorm forward + backward
 		"rmsnorm_f32", "rmsnorm_f64",
 		"rmsnorm_grad_f32", "rmsnorm_grad_f64",
+		// P3-EMB: Embedding forward (gather) + backward (scatter atomicAdd)
+		"embedding_f32", "embedding_f64",
+		"embedding_grad_f32", "embedding_grad_f64",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -881,6 +884,140 @@ func (b *PuregoBackend) RMSNormGradF64(x, gamma, dy, dx, dgamma DeviceBuffer, ro
 		return fmt.Errorf("cuMemsetD8(dgamma f64): %s", r.Error())
 	}
 	return b.launchRMSNormGradF64(x, gamma, dy, dx, dgamma, rows, cols, eps)
+}
+
+// ──────────────────────────────────────────────────────────
+// P3-EMB: Embedding forward (gather) + backward (scatter-accumulate atomicAdd).
+// 1 CTA per output row, block=min(hidden,256). Индексы int32 LE.
+// ──────────────────────────────────────────────────────────
+
+func (b *PuregoBackend) embeddingBlockDim(hidden int) uint32 {
+	if hidden < 256 {
+		return uint32(hidden)
+	}
+	return 256
+}
+
+func (b *PuregoBackend) launchEmbedding(fnName string, table, indices, out DeviceBuffer, hidden, n int) error {
+	fn, err := b.getKernel(fnName)
+	if err != nil {
+		return err
+	}
+	vt, vi, vo := table.deviceBuffer(), indices.deviceBuffer(), out.deviceBuffer()
+	args := struct {
+		table   uintptr
+		indices uintptr
+		out     uintptr
+		hidden  int32
+		n       int32
+	}{vt.ptr, vi.ptr, vo.ptr, int32(hidden), int32(n)}
+	params := [5]unsafe.Pointer{
+		unsafe.Pointer(&args.table),
+		unsafe.Pointer(&args.indices),
+		unsafe.Pointer(&args.out),
+		unsafe.Pointer(&args.hidden),
+		unsafe.Pointer(&args.n),
+	}
+	blockDim := b.embeddingBlockDim(hidden)
+	if r := cuLaunchKernel(fn,
+		uint32(n), 1, 1,
+		blockDim, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) launchEmbeddingGrad(fnName string, indices, dout, dtable DeviceBuffer, hidden, n int) error {
+	fn, err := b.getKernel(fnName)
+	if err != nil {
+		return err
+	}
+	vi, vdo, vdt := indices.deviceBuffer(), dout.deviceBuffer(), dtable.deviceBuffer()
+	args := struct {
+		indices uintptr
+		dout    uintptr
+		dtable  uintptr
+		hidden  int32
+		n       int32
+	}{vi.ptr, vdo.ptr, vdt.ptr, int32(hidden), int32(n)}
+	params := [5]unsafe.Pointer{
+		unsafe.Pointer(&args.indices),
+		unsafe.Pointer(&args.dout),
+		unsafe.Pointer(&args.dtable),
+		unsafe.Pointer(&args.hidden),
+		unsafe.Pointer(&args.n),
+	}
+	blockDim := b.embeddingBlockDim(hidden)
+	if r := cuLaunchKernel(fn,
+		uint32(n), 1, 1,
+		blockDim, 1, 1,
+		0, b.stream,
+		unsafe.Pointer(&params[0]),
+		nil,
+	); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(%s): %s", fnName, r.Error())
+	}
+	return nil
+}
+
+func (b *PuregoBackend) EmbeddingF32(table, indices, out DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingF32: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchEmbedding("embedding_f32", table, indices, out, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingF64(table, indices, out DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingF64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	return b.launchEmbedding("embedding_f64", table, indices, out, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingGradF32(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingGradF32: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	vdt := dtable.deviceBuffer()
+	if r := cuMemsetD8(vdt.ptr, 0, uint64(vocab*hidden*4)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dtable f32): %s", r.Error())
+	}
+	return b.launchEmbeddingGrad("embedding_grad_f32", indices, dout, dtable, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingGradF64(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingGradF64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	vdt := dtable.deviceBuffer()
+	if r := cuMemsetD8(vdt.ptr, 0, uint64(vocab*hidden*8)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dtable f64): %s", r.Error())
+	}
+	return b.launchEmbeddingGrad("embedding_grad_f64", indices, dout, dtable, hidden, n)
 }
 
 // ──────────────────────────────────────────────────────────

@@ -198,6 +198,29 @@ type Backend interface {
 	RMSNormGradF64(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float64) error
 	RMSNormGradF32(x, gamma, dy, dx, dgamma DeviceBuffer, rows, cols int, eps float32) error
 
+	// --- Embedding: gather / scatter-accumulate ---
+	//
+	// table   [vocab, hidden] row-major, F32 или F64.
+	// indices [n] int32 little-endian. Байты индексного буфера трактуются как
+	//   int32 непосредственно в PTX; система типов gotorch НЕ вводит Int32Storage
+	//   ради embedding (единственный не-float потребитель на данный момент).
+	//   Контракт индексов — свойство метода Embedding*, а не типа буфера.
+	// Валидность: 0 <= idx < vocab — обязанность вызывающего. Out-of-range = UB
+	//   в PTX (segfault на невалидном указателе или бит-мусор). Debug-путь тестов
+	//   выполняет CPU-предпроверку диапазона.
+	//
+	// Forward: out[i][d] = table[indices[i]][d] — чистый gather, bit-exact при
+	//   равных входах. Grid=(n,1,1), block=min(hidden,256).
+	// Backward: dtable[indices[i]][d] += dout[i][d] через atom.global.add.
+	//   dtable pre-zeroed внутри метода через cuMemsetD8 (как в RMSNormGrad).
+	//   ВАЖНО: float atomicAdd не ассоциативен -> два прогона grad могут дать
+	//   разницу ulp-порядка при коллизиях (повторяющиеся индексы). Ожидание
+	//   недетерминизма зафиксировано в тестах atomic-reproducibility.
+	EmbeddingF32(table, indices, out DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingF64(table, indices, out DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingGradF32(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingGradF64(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
+
 	// --- Reduce F64/F32 ---
 
 	SumF64(a DeviceBuffer, n int) (float64, error)

@@ -2156,6 +2156,217 @@ $Lgrms_f64_apply_loop:
 $Lgrms_f64_end:
     ret;
 }
+
+// ================================================================
+// P3-EMB: Embedding forward (gather) + backward (scatter-accumulate).
+// Contract:
+//   table [vocab, hidden] row-major, F32 or F64.
+//   indices [n] int32 little-endian.
+//   out [n, hidden] row-major, same dtype as table.
+// Forward: out[i][d] = table[indices[i]][d]  -- pure gather, bit-exact.
+// Backward: dtable[indices[i]][d] += dout[i][d]  -- atomicAdd; dtable
+// MUST be pre-zeroed (Go wrapper calls cuMemsetD8 before kernel).
+// Grid: 1 CTA per output row (n blocks), block=min(hidden,256).
+// Undefined behavior on out-of-range index (0 <= idx < vocab is caller's
+// responsibility; debug-path checks range in Go).
+// ================================================================
+
+// embedding_f32: gather rows of F32 table by int32 indices.
+.visible .entry embedding_f32(
+    .param .u64 p_table,
+    .param .u64 p_indices,
+    .param .u64 p_out,
+    .param .u32 p_hidden,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %row, %hidden, %n, %d, %idx32, %woff, %ooff;
+    .reg .u64 %table, %indices, %out, %addr, %off;
+    .reg .f32 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %table, [p_table];
+    ld.param.u64 %indices, [p_indices];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %hidden, [p_hidden];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %n;
+    @%p bra $Lemb_f32_end;
+    mov.u32 %tidx, %tid.x;
+
+    // idx = indices[row]  (int32, 4-byte stride)
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.s32 %idx32, [%addr];
+
+    // For each d = tidx, tidx+256, ..., < hidden: out[row][d] = table[idx][d]
+    mov.u32 %d, %tidx;
+$Lemb_f32_loop:
+    setp.ge.u32 %p, %d, %hidden;
+    @%p bra $Lemb_f32_end;
+    // Source: table + (idx*hidden + d) * 4
+    mul.lo.u32 %woff, %idx32, %hidden;
+    add.u32 %woff, %woff, %d;
+    mul.wide.u32 %off, %woff, 4;
+    add.u64 %addr, %table, %off;
+    ld.global.f32 %v, [%addr];
+    // Dest: out + (row*hidden + d) * 4
+    mul.lo.u32 %ooff, %row, %hidden;
+    add.u32 %ooff, %ooff, %d;
+    mul.wide.u32 %off, %ooff, 4;
+    add.u64 %addr, %out, %off;
+    st.global.f32 [%addr], %v;
+    add.u32 %d, %d, 256;
+    bra $Lemb_f32_loop;
+$Lemb_f32_end:
+    ret;
+}
+
+// embedding_f64: F64 version.
+.visible .entry embedding_f64(
+    .param .u64 p_table,
+    .param .u64 p_indices,
+    .param .u64 p_out,
+    .param .u32 p_hidden,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %row, %hidden, %n, %d, %idx32, %woff, %ooff;
+    .reg .u64 %table, %indices, %out, %addr, %off;
+    .reg .f64 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %table, [p_table];
+    ld.param.u64 %indices, [p_indices];
+    ld.param.u64 %out, [p_out];
+    ld.param.u32 %hidden, [p_hidden];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %n;
+    @%p bra $Lemb_f64_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.s32 %idx32, [%addr];
+
+    mov.u32 %d, %tidx;
+$Lemb_f64_loop:
+    setp.ge.u32 %p, %d, %hidden;
+    @%p bra $Lemb_f64_end;
+    mul.lo.u32 %woff, %idx32, %hidden;
+    add.u32 %woff, %woff, %d;
+    mul.wide.u32 %off, %woff, 8;
+    add.u64 %addr, %table, %off;
+    ld.global.f64 %v, [%addr];
+    mul.lo.u32 %ooff, %row, %hidden;
+    add.u32 %ooff, %ooff, %d;
+    mul.wide.u32 %off, %ooff, 8;
+    add.u64 %addr, %out, %off;
+    st.global.f64 [%addr], %v;
+    add.u32 %d, %d, 256;
+    bra $Lemb_f64_loop;
+$Lemb_f64_end:
+    ret;
+}
+
+// embedding_grad_f32: scatter-accumulate atomicAdd into dtable.
+// dtable pre-zeroed by wrapper via cuMemsetD8. Collisions on repeated
+// indices -> atomicAdd handles concurrency; float atomic non-associative
+// -> per-run bit-drift (documented, tested).
+.visible .entry embedding_grad_f32(
+    .param .u64 p_indices,
+    .param .u64 p_dout,
+    .param .u64 p_dtable,
+    .param .u32 p_hidden,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %row, %hidden, %n, %d, %idx32, %doff, %woff;
+    .reg .u64 %indices, %dout, %dtable, %addr, %off;
+    .reg .f32 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %indices, [p_indices];
+    ld.param.u64 %dout, [p_dout];
+    ld.param.u64 %dtable, [p_dtable];
+    ld.param.u32 %hidden, [p_hidden];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %n;
+    @%p bra $Lembg_f32_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.s32 %idx32, [%addr];
+
+    mov.u32 %d, %tidx;
+$Lembg_f32_loop:
+    setp.ge.u32 %p, %d, %hidden;
+    @%p bra $Lembg_f32_end;
+    // Load dout[row][d]
+    mul.lo.u32 %doff, %row, %hidden;
+    add.u32 %doff, %doff, %d;
+    mul.wide.u32 %off, %doff, 4;
+    add.u64 %addr, %dout, %off;
+    ld.global.f32 %v, [%addr];
+    // Atomic add into dtable[idx][d]
+    mul.lo.u32 %woff, %idx32, %hidden;
+    add.u32 %woff, %woff, %d;
+    mul.wide.u32 %off, %woff, 4;
+    add.u64 %addr, %dtable, %off;
+    atom.global.add.f32 %v, [%addr], %v;
+    add.u32 %d, %d, 256;
+    bra $Lembg_f32_loop;
+$Lembg_f32_end:
+    ret;
+}
+
+// embedding_grad_f64: F64 atomic-scatter.
+.visible .entry embedding_grad_f64(
+    .param .u64 p_indices,
+    .param .u64 p_dout,
+    .param .u64 p_dtable,
+    .param .u32 p_hidden,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %row, %hidden, %n, %d, %idx32, %doff, %woff;
+    .reg .u64 %indices, %dout, %dtable, %addr, %off;
+    .reg .f64 %v;
+    .reg .pred %p;
+
+    ld.param.u64 %indices, [p_indices];
+    ld.param.u64 %dout, [p_dout];
+    ld.param.u64 %dtable, [p_dtable];
+    ld.param.u32 %hidden, [p_hidden];
+    ld.param.u32 %n, [p_n];
+    mov.u32 %row, %ctaid.x;
+    setp.ge.u32 %p, %row, %n;
+    @%p bra $Lembg_f64_end;
+    mov.u32 %tidx, %tid.x;
+
+    mul.wide.u32 %off, %row, 4;
+    add.u64 %addr, %indices, %off;
+    ld.global.s32 %idx32, [%addr];
+
+    mov.u32 %d, %tidx;
+$Lembg_f64_loop:
+    setp.ge.u32 %p, %d, %hidden;
+    @%p bra $Lembg_f64_end;
+    mul.lo.u32 %doff, %row, %hidden;
+    add.u32 %doff, %doff, %d;
+    mul.wide.u32 %off, %doff, 8;
+    add.u64 %addr, %dout, %off;
+    ld.global.f64 %v, [%addr];
+    mul.lo.u32 %woff, %idx32, %hidden;
+    add.u32 %woff, %woff, %d;
+    mul.wide.u32 %off, %woff, 8;
+    add.u64 %addr, %dtable, %off;
+    atom.global.add.f64 %v, [%addr], %v;
+    add.u32 %d, %d, 256;
+    bra $Lembg_f64_loop;
+$Lembg_f64_end:
+    ret;
+}
 `
 // END-OF-STAGE-5-DISABLED-BLOCK-BELOW
 var _ = `
