@@ -22,6 +22,12 @@ type PuregoBackend struct {
 	ptxModule  uintptr            // CUmodule с r02bKernelsPTX (Этап 3)
 	fns        map[string]uintptr // CUfunction cache: name → handle (Этап 3+)
 	stream     uintptr            // CUstream для kernel launch (R03b-impl-2, default 0 = default stream)
+
+	// P5A-EMB-I64: scratch buffer для int64->int32 конверсии индексов.
+	// Ленивая аллокация в ensureScratchI32; растёт по потребности (2× грок),
+	// освобождается в Close. НЕ per-call alloc/free (горячий цикл).
+	scratchI32Ptr uintptr
+	scratchI32Cap int // capacity в bytes
 }
 
 // Assertion: *PuregoBackend удовлетворяет Backend.
@@ -146,6 +152,8 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		// P4-ROPE: RoPE F32 (on-the-fly sin/cos.approx) + F64 (host cos/sin tables)
 		"rope_f32", "rope_grad_f32",
 		"rope_f64", "rope_grad_f64",
+		// P5A-EMB-I64: int64->int32 index conversion (для I64-фасада Embedding)
+		"cvt_u64_to_u32",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -374,11 +382,16 @@ func (b *PuregoBackend) SetStream(s unsafe.Pointer) error {
 }
 
 func (b *PuregoBackend) Close() error {
-	// Порядок destroy: сначала PTX-модуль (использует контекст), потом
-	// cuBLAS handle, потом Release primary-context. Другие пользователи
-	// primary-контекста (goml/pytorch/...) продолжают жить: Release
-	// уменьшает refcount, реальный destroy случится когда refcount
+	// Порядок destroy: сначала scratch-буферы, потом PTX-модуль (использует
+	// контекст), потом cuBLAS handle, потом Release primary-context. Другие
+	// пользователи primary-контекста (goml/pytorch/...) продолжают жить:
+	// Release уменьшает refcount, реальный destroy случится когда refcount
 	// дойдёт до нуля.
+	if b.scratchI32Ptr != 0 {
+		cuMemFree(b.scratchI32Ptr)
+		b.scratchI32Ptr = 0
+		b.scratchI32Cap = 0
+	}
 	if b.ptxModule != 0 {
 		if r := cuModuleUnload(b.ptxModule); r != CUDA_SUCCESS {
 			return fmt.Errorf("cuModuleUnload: %s", r.Error())
@@ -392,6 +405,35 @@ func (b *PuregoBackend) Close() error {
 		b.cublas = 0
 	}
 	return check(cuDevicePrimaryCtxRelease(int32(b.device)), "cuDevicePrimaryCtxRelease")
+}
+
+// ensureScratchI32 — ленивая аллокация scratch буфера для int64->int32
+// конверсии индексов. Растёт по потребности (grow=2×need), никогда не
+// уменьшается. Освобождается в Close. Возвращает device-ptr на буфер
+// достаточного размера для n элементов int32.
+func (b *PuregoBackend) ensureScratchI32(n int) (uintptr, error) {
+	need := n * 4
+	if b.scratchI32Cap >= need {
+		return b.scratchI32Ptr, nil
+	}
+	if b.scratchI32Ptr != 0 {
+		if r := cuMemFree(b.scratchI32Ptr); r != CUDA_SUCCESS {
+			return 0, fmt.Errorf("cuMemFree(scratchI32): %s", r.Error())
+		}
+		b.scratchI32Ptr = 0
+		b.scratchI32Cap = 0
+	}
+	grow := need * 2
+	if grow < 1024 {
+		grow = 1024
+	}
+	var ptr uintptr
+	if r := cuMemAlloc(&ptr, uint64(grow)); r != CUDA_SUCCESS {
+		return 0, fmt.Errorf("cuMemAlloc(scratchI32=%d): %s", grow, r.Error())
+	}
+	b.scratchI32Ptr = ptr
+	b.scratchI32Cap = grow
+	return ptr, nil
 }
 
 // ──────────────────────────────────────────────────────────
@@ -1021,6 +1063,123 @@ func (b *PuregoBackend) EmbeddingGradF64(indices, dout, dtable DeviceBuffer, voc
 		return fmt.Errorf("cuMemsetD8(dtable f64): %s", r.Error())
 	}
 	return b.launchEmbeddingGrad("embedding_grad_f64", indices, dout, dtable, hidden, n)
+}
+
+// ──────────────────────────────────────────────────────────
+// P5A-EMB-I64: int64-фасад над int32-каноном.
+// Конверсионное PTX-ядро cvt_u64_to_u32 в scratch буфер, затем канонический
+// вызов. Scratch лениво растёт, освобождается в Close (см. ensureScratchI32).
+// ──────────────────────────────────────────────────────────
+
+// launchCvtU64ToU32 — тривиальный поэлементный конвертер.
+func (b *PuregoBackend) launchCvtU64ToU32(srcPtr, dstPtr uintptr, n int) error {
+	fn, err := b.getKernel("cvt_u64_to_u32")
+	if err != nil {
+		return err
+	}
+	args := struct {
+		src uintptr
+		dst uintptr
+		n   int32
+		_   int32
+	}{srcPtr, dstPtr, int32(n), 0}
+	params := [3]unsafe.Pointer{
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.n),
+	}
+	grid, block := launchGrid(n)
+	if r := cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(cvt_u64_to_u32): %s", r.Error())
+	}
+	return nil
+}
+
+// convertI64 — общий пред-шаг: конверсия indices64 в scratch как int32.
+// Возвращает ForeignStorage обёрнутый над scratch (DeviceBuffer для canonical launcher).
+func (b *PuregoBackend) convertI64ToScratch(indices64 DeviceBuffer, n int) (ForeignStorage, error) {
+	scratchPtr, err := b.ensureScratchI32(n)
+	if err != nil {
+		return ForeignStorage{}, err
+	}
+	vi := indices64.deviceBuffer()
+	if err := b.launchCvtU64ToU32(vi.ptr, scratchPtr, n); err != nil {
+		return ForeignStorage{}, err
+	}
+	return ForeignStorage{ptr: scratchPtr, sizeBytes: n * 4, device: b.device}, nil
+}
+
+func (b *PuregoBackend) EmbeddingF32I64(table, indices64, out DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingF32I64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	scratch, err := b.convertI64ToScratch(indices64, n)
+	if err != nil {
+		return err
+	}
+	return b.launchEmbedding("embedding_f32", table, scratch, out, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingF64I64(table, indices64, out DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingF64I64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	scratch, err := b.convertI64ToScratch(indices64, n)
+	if err != nil {
+		return err
+	}
+	return b.launchEmbedding("embedding_f64", table, scratch, out, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingGradF32I64(indices64, dout, dtable DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingGradF32I64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	scratch, err := b.convertI64ToScratch(indices64, n)
+	if err != nil {
+		return err
+	}
+	vdt := dtable.deviceBuffer()
+	if r := cuMemsetD8(vdt.ptr, 0, uint64(vocab*hidden*4)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dtable f32): %s", r.Error())
+	}
+	return b.launchEmbeddingGrad("embedding_grad_f32", scratch, dout, dtable, hidden, n)
+}
+
+func (b *PuregoBackend) EmbeddingGradF64I64(indices64, dout, dtable DeviceBuffer, vocab, hidden, n int) error {
+	if vocab <= 0 || hidden <= 0 || n <= 0 {
+		return fmt.Errorf("cuda.EmbeddingGradF64I64: vocab/hidden/n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	scratch, err := b.convertI64ToScratch(indices64, n)
+	if err != nil {
+		return err
+	}
+	vdt := dtable.deviceBuffer()
+	if r := cuMemsetD8(vdt.ptr, 0, uint64(vocab*hidden*8)); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemsetD8(dtable f64): %s", r.Error())
+	}
+	return b.launchEmbeddingGrad("embedding_grad_f64", scratch, dout, dtable, hidden, n)
 }
 
 // ──────────────────────────────────────────────────────────

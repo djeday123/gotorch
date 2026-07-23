@@ -221,6 +221,17 @@ type Backend interface {
 	EmbeddingGradF32(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
 	EmbeddingGradF64(indices, dout, dtable DeviceBuffer, vocab, hidden, n int) error
 
+	// --- Embedding I64-фасад (P5A): индустриальный контракт "движок принимает
+	// оба типа индексов". Внутри — конверсия int64->int32 через PTX-ядро
+	// cvt_u64_to_u32 в переиспользуемый scratch-буфер, затем канонический вызов.
+	// Валидность: 0 <= idx < vocab И idx < 2^31 -- обязанность вызывающего;
+	// нарушение = silent truncation в PTX (нижние 32 бита).
+	// Scratch аллоцируется лениво, растёт по потребности, освобождается в Close.
+	EmbeddingF32I64(table, indices64, out DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingF64I64(table, indices64, out DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingGradF32I64(indices64, dout, dtable DeviceBuffer, vocab, hidden, n int) error
+	EmbeddingGradF64I64(indices64, dout, dtable DeviceBuffer, vocab, hidden, n int) error
+
 	// --- RoPE: Rotary Positional Embedding ---
 	//
 	// x, out: [batch, heads, seqLen, headDim] row-major, F32 или F64.

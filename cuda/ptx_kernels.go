@@ -2369,6 +2369,42 @@ $Lembg_f64_end:
 }
 
 // ================================================================
+// P5A-EMB-I64: int64 -> int32 index conversion for I64 facade.
+// Trivial elementwise cvt.u32.u64. Grid=ceil(n/256), block=256.
+// Caller contract: 0 <= src[i] < 2^31 (else silent truncation to low 32 bits).
+// ================================================================
+.visible .entry cvt_u64_to_u32(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u32 p_n
+) {
+    .reg .u32 %tidx, %bidx, %n, %idx, %v32;
+    .reg .u64 %src, %dst, %v64, %addr, %off;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+    mov.u32 %bidx, %ctaid.x;
+    mad.lo.u32 %idx, %bidx, 256, %tidx;
+    setp.ge.u32 %p, %idx, %n;
+    @%p bra $L_cvt_end;
+
+    mul.wide.u32 %off, %idx, 8;
+    add.u64 %addr, %src, %off;
+    ld.global.u64 %v64, [%addr];
+    cvt.u32.u64 %v32, %v64;
+
+    mul.wide.u32 %off, %idx, 4;
+    add.u64 %addr, %dst, %off;
+    st.global.u32 [%addr], %v32;
+$L_cvt_end:
+    ret;
+}
+
+// ================================================================
 // P4-ROPE: Rotary Positional Embedding forward + backward, F32 (on-the-fly
 // sin/cos.approx.f32) and F64 (host-precomputed cos/sin tables).
 //
