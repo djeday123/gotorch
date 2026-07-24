@@ -1653,6 +1653,91 @@ func (b *PuregoBackend) matMulBatchedF64Loop(a, bb, c DeviceBuffer,
 	return nil
 }
 
+// MatMulF32Ex — F32 GEMM с per-call trans-флагами через wrapper (gt_gemm_ex).
+// A-0 (2026-07-24): используется для matmul-backward (gradOW = normed^T @ gradLogits)
+// на GPU без модификации существующего MatMulF32.
+//
+// Row-major convention (после swap trick):
+//   Output C[m, n] = op(A)[m, k] · op(B)[k, n]
+//   transA=true  → A stored [k, m] row-major
+//   transB=true  → B stored [n, k] row-major
+//
+// Compute: FP32 accumulator (CUBLAS_COMPUTE_32F, НЕ TF32) — для accuracy A/B c
+// legacy CPU host-loop backward'ом. TF32 mode дал бы rel~1e-3 (см. MatMulF32_TF32).
+//
+// Требует libgotorch_blas_wrapper.so (gt_gemm_ex с 19 struct args).
+func (b *PuregoBackend) MatMulF32Ex(a, bb, c DeviceBuffer, m, n, k int, transA, transB bool) error {
+	if m <= 0 || n <= 0 || k <= 0 {
+		return fmt.Errorf("cuda.MatMulF32Ex: m/n/k must be > 0, got %d/%d/%d", m, n, k)
+	}
+	if !HasBlasWrapper() {
+		return fmt.Errorf("cuda.MatMulF32Ex: libgotorch_blas_wrapper.so required")
+	}
+	if err := b.bind(); err != nil {
+		return err
+	}
+	defer runtime.UnlockOSThread()
+	alpha, beta := float32(1.0), float32(0.0)
+	va, vb, vc := a.deviceBuffer(), bb.deviceBuffer(), c.deviceBuffer()
+
+	// Row strides of stored matrices:
+	//   A stored [m,k] (transA=false): row stride k
+	//   A stored [k,m] (transA=true):  row stride m
+	//   B stored [k,n] (transB=false): row stride n
+	//   B stored [n,k] (transB=true):  row stride k
+	ldaRow := k
+	if transA {
+		ldaRow = m
+	}
+	ldbRow := n
+	if transB {
+		ldbRow = k
+	}
+
+	opA := int32(CUBLAS_OP_N)
+	if transA {
+		opA = int32(CUBLAS_OP_T)
+	}
+	opB := int32(CUBLAS_OP_N)
+	if transB {
+		opB = int32(CUBLAS_OP_T)
+	}
+
+	// Swap trick: cuBLAS column-major, но данные row-major.
+	// Row-major C = op(A)·op(B) ⇔ Col-major C^T = op(B)^T·op(A)^T ⇔
+	// эквивалентно cublasGemm(opB, opA, N_col=n, M_col=m, K_col=k,
+	//                         B_ptr, ldb=row_stride_of_B,
+	//                         A_ptr, lda=row_stride_of_A,
+	//                         C_ptr, ldc=row_stride_of_C).
+	// В struct GemmExArgs TransA соответствует ПЕРВОМУ operand'у (наш B_row),
+	// TransB — ВТОРОМУ operand'у (наш A_row).
+	args := GemmExArgs{
+		Stream: b.stream,
+		TransA: opB, TransB: opA,
+		M:           int32(n),
+		N:           int32(m),
+		K:           int32(k),
+		Alpha:       unsafe.Pointer(&alpha),
+		A:           vb.ptr,
+		AType:       CUDA_R_32F,
+		Lda:         int32(ldbRow),
+		B:           va.ptr,
+		BType:       CUDA_R_32F,
+		Ldb:         int32(ldaRow),
+		Beta:        unsafe.Pointer(&beta),
+		C:           vc.ptr,
+		CType:       CUDA_R_32F,
+		Ldc:         int32(n),
+		ComputeType: CUBLAS_COMPUTE_32F,
+		Algo:        CUBLAS_GEMM_DEFAULT,
+	}
+	st := gtGemmEx(unsafe.Pointer(&args))
+	if st != int32(CUBLAS_STATUS_SUCCESS) {
+		return fmt.Errorf("gt_gemm_ex(F32Ex): %s", cublasStatus(st).Error())
+	}
+	return nil
+}
+
 func (b *PuregoBackend) MatMulStridedBatchedF32(a, bb, c DeviceBuffer,
 	batch, m, n, k int,
 	strideA, strideB, strideC int64) error {

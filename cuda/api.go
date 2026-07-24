@@ -274,6 +274,15 @@ type Backend interface {
 	// у которых cublas handle глобально в TF32. См. R03b_design.md impl-4-final.
 	MatMulF32_TF32(a, b, c DeviceBuffer, m, n, k int) error
 
+	// MatMulF32Ex — F32 GEMM с per-call trans-флагами (A-0, 2026-07-24).
+	// Row-major: C[m,n] = op(A)[m,k] · op(B)[k,n], где op зависит от transA/transB.
+	//   transA=true  → A stored row-major shape [k,m], читается как A^T.
+	//   transB=true  → B stored row-major shape [n,k], читается как B^T.
+	// Compute: полный FP32 accumulator (не TF32) — для accuracy A/B с CPU host-loop bwd.
+	// Требует libgotorch_blas_wrapper.so (uses gt_gemm_ex struct-args).
+	// Назначение: matmul-backward gradOW = normed^T @ gradLogits на GPU.
+	MatMulF32Ex(a, b, c DeviceBuffer, m, n, k int, transA, transB bool) error
+
 	// --- Batched MatMul (B-impl-1) ---
 	//
 	// A[batch, M, K] × B[batch, K, N] = C[batch, M, N] с явным strided layout.
