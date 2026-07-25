@@ -126,7 +126,47 @@
 
 ## Этапы 2-5: план (заполнится по факту)
 
-### Этап 2 G1: LSE-forward сборка (**СЛЕДУЮЩИЙ ХОД**)
+### Этап 2 G1: LSE-forward сборка — ✅ PASS (2026-07-25)
+
+**Сборка:**
+- `libs/fa_sm120/Makefile`: добавлено правило `_v121r_train_kernel_full.cu` (concat kernel+launcher), в `SRCS_CU`.
+- `libs/fa_sm120/src/fa_ctx.cu`: namespace declaration `fa_sm120_v121r_train::launch` + новая extern-C функция `fa_forward_train(...)` РЯДОМ с `fa_forward` (production ABI unchanged).
+- `libs/fa_sm120/include/fa_sm120.h`: прототип `fa_forward_train`.
+- Rebuild: **train kernel 255 registers, 0 spill/stack, 1 barrier** (в допуске +2-3 vs production 244 fits within 255 ceiling).
+- Symbols exported: `fa_forward_train` @ 0x4090 alongside `fa_forward` @ 0x3d00 — production символ бит-в-бит цел.
+
+**FA-canary до/после сборки:**
+- До: median 653.24T, mean 653.36T, WITHIN.
+- После: median 653.39T, mean 653.38T, WITHIN (delta 0.15T = 0.02%, шум) — **production fa_forward не задет**.
+
+**Purego binding:** `goml/backend/cuda/fa_forward.go` (~180 строк).
+- Поиск .so: `$GOML_FA_LIB` → `libs/fa_sm120/libfa_sm120.so` → fallback пути.
+- API: `FALoad()`, `FACreate()/Destroy()`, `FAContext.ForwardTrain(...)`, `FAVersion()`.
+- Внутри `ForwardTrain`: `runtime.LockOSThread` per-call (мостовая дисциплина — FA использует cudaGetDevice on current thread).
+
+**L-correctness тесты** (`goml/backend/cuda/fa_forward_test.go`, форма несимметричная bh=3, sl=280, hd=128):
+
+| test | форма | L values | vs ref | verdict |
+|------|-------|----------|--------|---------|
+| Version | — | 0.1.0+652T-sm120a | — | ✓ |
+| L_Uniform (Q=K=V=1.0) | bh=3, sl=280 | 16.9526 uniform | ref 16.9485, rel **2.4e-4** | ✓ (floor 5e-3) |
+| L_Layout (Q per-row 1/2/4) | bh=3, sl=280 | row0=16.95, row1=28.27, row2=50.91 | все ref-per-row rel 2-3e-4 | ✓ (floor 5e-3) |
+
+**Cross-check layout** (обязательный по правилу пользователя — off-by-one убьёт bwd тихо):
+- `L[sl-1]` (последний s row 0) ≈ refRow0 = 16.9485 ✓ (не refRow1 — не [sl, bh] layout).
+- `L[sl]` (первый s row 1) = 28.27 = refRow1 ✓.
+- **[bh, sl] row-major layout подтверждён.**
+
+**Механизм ошибки 4e-3 abs / 2.4e-4 rel:**
+- FP8 e4m3 quantization noise: decoded_Q · decoded_K ≠ true F32 product (ULP-класс 2^-3 mantissa).
+- F32 accumulation over hd=128: sqrt(128)·eps ≈ 6.8e-7 negligible vs FP8.
+- Kernel exp2.approx.f16x2 (log2-space softmax): ~1 ULP.
+- Дом. вклад — FP8 quantize noise + log-conversion.
+- **Внутри floor 5e-3 (FP8 attention class), запас 20×.**
+
+**G1 закрыт.** `fa_forward_train` production-ready в libfa_sm120.so. L-сертификат: значения + раскладка + асимметричная форма пройдены.
+
+### Этап 2 G2: bwd .so сборка (**СЛЕДУЮЩИЙ ХОД** — после user check)
 
 1. Добавить `_v121r_train_kernel.cu + _v121r_train_launcher.cuh` в `libs/fa_sm120/Makefile` SRCS_CU (аналог правила `_v121r_kernel_full.cu`).
 2. В `fa_ctx.cu`: добавить `namespace fa_sm120_v121r_train { extern void launch(...); }` + новую extern-C функцию `fa_forward_train(ctx, q, k, v, o, l_out, bh, sl, hd, causal, window, scale, stream) → fa_status_t`.
