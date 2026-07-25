@@ -166,7 +166,53 @@
 
 **G1 закрыт.** `fa_forward_train` production-ready в libfa_sm120.so. L-сертификат: значения + раскладка + асимметричная форма пройдены.
 
-### Этап 2 G2: bwd .so сборка (**СЛЕДУЮЩИЙ ХОД** — после user check)
+### Этап 2 G2: bwd .so сборка — ✅ PASS (2026-07-25)
+
+**Сборка `libfa_bwd_sm120.so`** (отдельный .so, боевой libfa_sm120.so не тронут):
+- `libs/fa_bwd_sm120/Makefile` — build правила (nvcc 13.1.115, sm_120a, -O3 -fPIC).
+- `libs/fa_bwd_sm120/src/wrapper.cu` — 4 extern-C entries + gt_fa_bwd_kernel_regs (fingerprint helper через cudaFuncGetAttributes). Только развёртка аргументов, никакой логики.
+- `libs/fa_bwd_sm120/include/fa_bwd_sm120.h` — extern-C прототипы + docs про stride_ds/dual-dS/zero-init requirements.
+- Kernel objs слинкованы из `../../release_v0.2.0/src/` (6 файлов: dk, dk_new, dq_new, ds_gen, dv_mma_p1, merged_v1).
+- Symbols: gt_fa_bwd_d_precompute/merged/dk/dq/kernel_regs — все 5 экспортированы.
+
+**Fingerprint gate — PASS БАЙТ-В-БАЙТ:**
+
+| kernel | ptxas numRegs (build) | cert reference (bench_r2c_e2e.cu:67-73) | verdict |
+|--------|----------------------|------------------------------------------|---------|
+| `kernel_d_precompute` | **38** | 38 | ✓ |
+| `kernel_merged_v1` | **252** | 252 | ✓ |
+| `kernel_dk_new` | **124** | 124 | ✓ |
+| `kernel_dq_new` | **69** | 69 | ✓ |
+
+nvcc versions: current CUDA 13.1.115 = cert-requirement «CUDA 13.1+». Regs match → бинари эквивалентны сертификационным.
+
+**FA-canary до/после G2 сборки:**
+- До: median 653.39T, WITHIN [652, 656].
+- После: median 653.62T, WITHIN (delta 0.23T = 0.04%, шум). Боевой forward .so не задет.
+
+**Purego binding** (`goml/backend/cuda/fa_backward.go`, ~150 строк):
+- FABwdLoad, FABwdKernelRegs, FABwdDPrecompute, FABwdMerged, FABwdDK, FABwdDQ.
+- LockOSThread per-call (мостовая дисциплина).
+
+**Smoke тесты** (`goml/backend/cuda/fa_backward_test.go`) — 3/3 PASS:
+
+| test | форма | результат |
+|------|-------|-----------|
+| Fingerprints | — | 38/252/124/69 all OK ✓ |
+| D-precompute | bh=1, sl=128, hd=128, random O/dO | worst abs 9.5e-7, **rel 2.2e-5** (floor 5e-3, запас 200×) ✓ |
+| CanonicalChain | bh=128, sl=8192, hd=128 (cert form) | L от fa_forward_train → 4 launcher chain PASS. All outputs non-NaN/non-Inf. dV∈[-2.8e-3, 2.8e-3], dK=dQ=0 (мат. корректно для uniform K,Q — доп. sanity check), D∈[-3.19, 2.57], L=20.33=sqrt(128)+log(8192) ✓ |
+
+**Первая живая стыковка G1→G2:** L из `fa_forward_train` подаётся в `gt_fa_bwd_merged`, chain работает без ошибок.
+
+**G2 закрыт.** libfa_bwd_sm120.so production-ready:
+- Собирается detached от боевого forward .so.
+- Fingerprints БАЙТ-В-БАЙТ vs cert reference (nvcc 13.1.115 согласован).
+- D-сверка PASS (простейший из четырёх, ловит контрактные ошибки раньше остальных).
+- Canonical chain smoke PASS (все 4 launchers работают, G1→G2 стыковка живая).
+
+**НЕ встроено** в trainStep (по ТЗ — G2 только «собирается, запускается, отпечатки совпадают»). Встройка — следующее звено (решение по карте после smoke данных).
+
+### Этап 3-5 (СЛЕДУЮЩИЙ ХОД после user check)
 
 1. Добавить `_v121r_train_kernel.cu + _v121r_train_launcher.cuh` в `libs/fa_sm120/Makefile` SRCS_CU (аналог правила `_v121r_kernel_full.cu`).
 2. В `fa_ctx.cu`: добавить `namespace fa_sm120_v121r_train { extern void launch(...); }` + новую extern-C функцию `fa_forward_train(ctx, q, k, v, o, l_out, bh, sl, hd, causal, window, scale, stream) → fa_status_t`.
