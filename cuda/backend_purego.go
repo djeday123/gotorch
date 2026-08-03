@@ -158,6 +158,8 @@ func newPuregoBackend(device int) (*PuregoBackend, error) {
 		"cvt_f32_to_f16", "cvt_f16_to_f32",
 		// B-impl-3: FP8 E4M3 quantize/cast (MatMul через cublasLt wrapper, не PTX).
 		"quantize_f32_to_f8e4m3", "cast_f8e4m3_to_f32",
+		// A-LLM-5: квант-контракт O(1) (scale = amax, decoded <= 1).
+		"quantize_f32_to_f8e4m3_unit",
 	}
 	for _, name := range kernelNames {
 		if _, err := pb.getKernel(name); err != nil {
@@ -2007,6 +2009,43 @@ func (b *PuregoBackend) QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, 
 	if r := cuLaunchKernel(fn, 1, 1, 1, 256, 1, 1, 0, b.stream,
 		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
 		return fmt.Errorf("cuLaunchKernel(quantize_f32_to_f8e4m3): %s", r.Error())
+	}
+	return nil
+}
+
+// QuantizeF32ToF8E4M3Unit — A-LLM-5 квант-контракт O(1): scale = amax
+// (не amax/448), decoded |dst| <= 1. Обязателен для FA-ядер v121r-класса
+// (FP16-акки QK/O MMA переполняются на decoded +-448 — Н4, goml A_LLM4).
+func (b *PuregoBackend) QuantizeF32ToF8E4M3Unit(src, dst, scale, amax DeviceBuffer, n int) error {
+	if n <= 0 {
+		return fmt.Errorf("cuda.QuantizeF32ToF8E4M3Unit: n must be > 0")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := check(cuCtxSetCurrent(b.primaryCtx), "cuCtxSetCurrent"); err != nil {
+		return err
+	}
+	fn, err := b.getKernel("quantize_f32_to_f8e4m3_unit")
+	if err != nil {
+		return err
+	}
+	vs, vd := src.deviceBuffer(), dst.deviceBuffer()
+	vsc, vam := scale.deviceBuffer(), amax.deviceBuffer()
+	args := struct {
+		src, dst, scale, amax uintptr
+		n                     int32
+		_                     int32
+	}{vs.ptr, vd.ptr, vsc.ptr, vam.ptr, int32(n), 0}
+	params := [5]unsafe.Pointer{
+		unsafe.Pointer(&args.src),
+		unsafe.Pointer(&args.dst),
+		unsafe.Pointer(&args.scale),
+		unsafe.Pointer(&args.amax),
+		unsafe.Pointer(&args.n),
+	}
+	if r := cuLaunchKernel(fn, 1, 1, 1, 256, 1, 1, 0, b.stream,
+		unsafe.Pointer(&params[0]), nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(quantize_f32_to_f8e4m3_unit): %s", r.Error())
 	}
 	return nil
 }

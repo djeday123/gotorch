@@ -339,6 +339,12 @@ type Backend interface {
 	// PTX ядро с SMEM tree-reduction для amax, F32->F8E4M3 cvt.
 	QuantizeF32ToF8E4M3(src, dst, scale, amax DeviceBuffer, n int) error
 
+	// QuantizeF32ToF8E4M3Unit -- A-LLM-5 квант-контракт O(1): scale = amax
+	// (не amax/448), decoded |dst| <= 1. Обязателен для FA-ядер v121r-класса:
+	// их FP16-акки (QK/O MMA f16.e4m3.e4m3.f16) переполняются на decoded +-448
+	// (Н4, goml A_LLM4_fa_integration.md).
+	QuantizeF32ToF8E4M3Unit(src, dst, scale, amax DeviceBuffer, n int) error
+
 	// CastF8E4M3ToF32 -- широкая конверсия обратно (dequantize).
 	// Учитывает scale device float*: dst[i] = f8_to_f32(src[i]) * scale[0].
 	CastF8E4M3ToF32(src, dst, scale DeviceBuffer, n int) error

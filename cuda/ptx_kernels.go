@@ -2928,6 +2928,113 @@ $L_q_write_end:
     ret;
 }
 
+// quantize_f32_to_f8e4m3_unit(src, dst, scale, amax, n) -- A-LLM-5 (2026-08-03).
+// O(1) quantization contract variant (H4, goml A_LLM4): scale = amax (NOT
+// amax/448), decoded |dst| <= 1.0. Required for v121r-class FA kernels: their
+// FP16 accumulators (QK/O MMA f16.e4m3.e4m3.f16) overflow on decoded +-448.
+// Body identical to quantize_f32_to_f8e4m3, only phase 2 differs.
+.visible .entry quantize_f32_to_f8e4m3_unit(
+    .param .u64 p_src,
+    .param .u64 p_dst,
+    .param .u64 p_scale,
+    .param .u64 p_amax,
+    .param .u32 p_n
+) {
+    .shared .align 4 .f32 sm_amax_u[256];
+    .reg .u32 %tidx, %n, %j, %stride, %addr_smem;
+    .reg .u32 %addr_smem_partner;
+    .reg .u64 %src, %dst, %scale_p, %amax_p, %addr, %off;
+    .reg .f32 %v, %av, %my_amax, %row_amax, %scale, %eps;
+    .reg .f32 %other, %inv_scale;
+    .reg .b16 %packed_hi16;
+    .reg .pred %p;
+
+    ld.param.u64 %src, [p_src];
+    ld.param.u64 %dst, [p_dst];
+    ld.param.u64 %scale_p, [p_scale];
+    ld.param.u64 %amax_p, [p_amax];
+    ld.param.u32 %n, [p_n];
+
+    mov.u32 %tidx, %tid.x;
+
+    // Phase 1: per-thread accumulate absmax.
+    mov.f32 %my_amax, 0f00000000;
+    mov.u32 %j, %tidx;
+$L_qu_loop:
+    setp.ge.u32 %p, %j, %n;
+    @%p bra $L_qu_reduce;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v, [%addr];
+    abs.f32 %av, %v;
+    max.f32 %my_amax, %my_amax, %av;
+    add.u32 %j, %j, 256;
+    bra $L_qu_loop;
+
+$L_qu_reduce:
+    shl.b32 %addr_smem, %tidx, 2;
+    mov.u32 %stride, sm_amax_u;
+    add.u32 %addr_smem, %addr_smem, %stride;
+    st.shared.f32 [%addr_smem], %my_amax;
+    bar.sync 0;
+    mov.u32 %stride, 128;
+$L_qu_red_step:
+    setp.eq.u32 %p, %stride, 0;
+    @%p bra $L_qu_red_done;
+    setp.ge.u32 %p, %tidx, %stride;
+    @%p bra $L_qu_red_skip;
+    add.u32 %addr_smem_partner, %tidx, %stride;
+    shl.b32 %addr_smem_partner, %addr_smem_partner, 2;
+    mov.u32 %j, sm_amax_u;
+    add.u32 %addr_smem_partner, %addr_smem_partner, %j;
+    ld.shared.f32 %row_amax, [%addr_smem];
+    ld.shared.f32 %other, [%addr_smem_partner];
+    max.f32 %row_amax, %row_amax, %other;
+    st.shared.f32 [%addr_smem], %row_amax;
+$L_qu_red_skip:
+    bar.sync 0;
+    shr.u32 %stride, %stride, 1;
+    bra $L_qu_red_step;
+$L_qu_red_done:
+    mov.u32 %j, sm_amax_u;
+    ld.shared.f32 %row_amax, [%j];
+    bar.sync 0;
+
+    // Phase 2 (DIFFERS from base): scale = amax. If amax < 1e-13 -> scale = 1.0.
+    setp.ne.u32 %p, %tidx, 0;
+    @%p bra $L_qu_after_scale;
+    mov.f32 %eps, 0f2ACBCCCC;      // 1e-13
+    setp.lt.f32 %p, %row_amax, %eps;
+    @%p mov.f32 %scale, 0f3F800000; // 1.0
+    @!%p mov.f32 %scale, %row_amax;
+    st.global.f32 [%scale_p], %scale;
+    st.global.f32 [%amax_p], %row_amax;
+$L_qu_after_scale:
+    bar.sync 0;
+
+    ld.global.f32 %scale, [%scale_p];
+    mov.f32 %inv_scale, 0f3F800000;
+    div.approx.f32 %inv_scale, %inv_scale, %scale;
+
+    // Phase 3: dst[i] = cvt.rn.satfinite.e4m3x2.f32 (src[i] * inv_scale).
+    mov.u32 %j, %tidx;
+$L_qu_write_loop:
+    setp.ge.u32 %p, %j, %n;
+    @%p bra $L_qu_write_end;
+    mul.wide.u32 %off, %j, 4;
+    add.u64 %addr, %src, %off;
+    ld.global.f32 %v, [%addr];
+    mul.f32 %v, %v, %inv_scale;
+    cvt.rn.satfinite.e4m3x2.f32 %packed_hi16, %v, %v;
+    mul.wide.u32 %off, %j, 1;
+    add.u64 %addr, %dst, %off;
+    st.global.b8 [%addr], %packed_hi16;
+    add.u32 %j, %j, 256;
+    bra $L_qu_write_loop;
+$L_qu_write_end:
+    ret;
+}
+
 // cast_f8e4m3_to_f32(src, dst, scale, n):
 // dst[i] = f8_to_f32(src[i]) * scale[0]. dequantize with per-tensor scale.
 // PTX cvt.rn.f32.e4m3x2 unpacks single f8 pair -> f32 pair; we handle scalar case.
